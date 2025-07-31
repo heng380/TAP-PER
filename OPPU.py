@@ -211,9 +211,11 @@ print_trainable_parameters(model)
 
 pred_all = []
 actual = []
-train_data = []
+
 
 for i in tqdm(range(len(test_data))):
+    
+    train_data = []
     model = get_peft_model(base_model, peft_config)
     print_trainable_parameters(model)
 
