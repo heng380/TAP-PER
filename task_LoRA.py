@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-import bitsandbytes as bnb
+import os
 from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
 # from transformers import pipeline, BitsAndBytesConfig
 import argparse
@@ -14,8 +14,8 @@ from tqdm import tqdm
 
 
 parser = argparse.ArgumentParser(description="Parser for LoRA")
-parser.add_argument('--model_name', type=str, default='meta-llama/Llama-2-7b-hf')
-parser.add_argument('--batch_size', type=int, default=16)
+parser.add_argument('--model_name', type=str, default='/cfs/models/llama/llama3.1-8B')
+parser.add_argument('--batch_size', type=int, default=8)
 parser.add_argument('--k', type=int, default=0)
 parser.add_argument('--max_step', type=int, default=5000)
 parser.add_argument('--cut_off', type=int, default=2048)
@@ -24,8 +24,17 @@ parser.add_argument('--temperature', type=float, default=0.1)
 parser.add_argument('--task_name', type=str, default='movie_tagging')
 parser.add_argument('--add_profile', action='store_true')
 parser.add_argument('--access_token', type=str, default=None)
+parser.add_argument('--only_json', action='store_true', help='Skip training and only run inference to write json')
+parser.add_argument('--ckpt_path', type=str, default='', help='LoRA checkpoint path for --only_json')
+parser.add_argument('--local_rank', type=int, default=-1, help='Local rank for DDP')
 
 args = parser.parse_args()
+if args.local_rank == -1 and "LOCAL_RANK" in os.environ:
+    args.local_rank = int(os.environ["LOCAL_RANK"])
+if args.local_rank != -1:
+    torch.cuda.set_device(args.local_rank)
+
+is_main_process = args.local_rank in (-1, 0)
 model_name = args.model_name
 task_name = args.task_name
 batch_size = args.batch_size
@@ -63,20 +72,24 @@ max_epoch = args.max_epoch
 # )
 
 tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left", token=args.access_token)
-tokenizer.eos_token = "</s>"
-tokenizer.pad_token = '[PAD]'
-# tokenizer.pad_token = tokenizer.eos_token
-tokenizer.pad_token_id = tokenizer.eos_token_id
+if tokenizer.eos_token is None:
+    tokenizer.eos_token = "</s>"
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token or "[PAD]"
+if tokenizer.pad_token_id is None:
+    tokenizer.pad_token_id = tokenizer.eos_token_id
 
 
 base_model = AutoModelForCausalLM.from_pretrained(
     model_name,
     # quantization_config=bnb_config,
     local_files_only=False,
-    device_map='auto',
+    device_map=None,
     trust_remote_code=True,
     torch_dtype=torch.bfloat16
 )
+if args.local_rank != -1:
+    base_model = base_model.to(torch.device("cuda", args.local_rank))
 
 base_model.config.use_cache = False
 base_model.config.pad_token_id = tokenizer.pad_token_id
@@ -91,7 +104,7 @@ base_model = prepare_model_for_kbit_training(base_model)
 
 
 
-from peft import LoraConfig, get_peft_model 
+from peft import LoraConfig, get_peft_model, PeftModel
 
 peft_config = LoraConfig(
     r=8,
@@ -119,6 +132,7 @@ training_arguments = transformers.TrainingArguments(
     group_by_length=True,
     lr_scheduler_type='linear',
     report_to='none',
+    ddp_find_unused_parameters=False,
 )
 
 
@@ -136,11 +150,11 @@ elif args.task_name == "news_categorize":
 elif args.task_name == "news_headline":
     extract_article = extract_news_headline
 elif args.task_name == "product_rating":
-    extract_article = extrat_product_review
+    extract_article = extract_product_review
 elif args.task_name == "scholarly_title":
     extract_article = extract_scholarly_title
 elif args.task_name == "tweet_paraphrase":
-    extract_article = extrat_tweet_paraphrasing
+    extract_article = extract_tweet_paraphrasing
 
 
 with open('./prompt/prompt.json', 'r') as f:
@@ -204,89 +218,104 @@ def generate_and_tokenize_prompt(data_point):
 # training
 from datasets import load_dataset, Dataset
 model = get_peft_model(base_model, peft_config)
-print_trainable_parameters(model)
+if is_main_process:
+    print_trainable_parameters(model)
 
 pred_all = []
 actual = []
 train_data = []
 
-for i in tqdm(range(len(train))):
-    if args.add_profile:
-        profile = train_profile[i]['output']
-
-    for idx, q in enumerate(train[i]['query']):
-
-        if args.task_name != "citation":
-            article = get_first_k_tokens(extract_article(q['input']), 768)
-            prompt = prompt_template[args.task_name]['prompt'].format(article)
-            full_prompt = prompt_template[args.task_name]['full_prompt'].format(get_first_k_tokens(extract_article(q['input']), 768), q['gold'])
-        
-        else:
-            question = q['input']
-            article = extract_citation_title(question)
-            option1, option2 = extract_option(question, 1), extract_option(question, 2)
-
-            prompt = prompt_template[args.task_name]['prompt'].format(article, option1, option2)
-            full_prompt = prompt_template[args.task_name]['full_prompt'].format(article, option1, option2, q['gold'])
-
-        if k > 0:
-            visible_history_list = train[i]['profile']
-
-            for p in visible_history_list:
-                for key, value in p.items():
-                    p[key] = get_first_k_tokens(p[key], 368)
-
-            history_list = [prompt_template[args.task_name]['retrieval_history'].format(**p) for p in visible_history_list]
-            tokenized_corpus = [doc.split(" ") for doc in history_list]
-            bm25 = BM25Okapi(tokenized_corpus)
-
-            tokenized_query = prompt_template[args.task_name]["retrieval_query_wokey"].format(article).split(' ')
-            retrieved_history = bm25.get_top_n(tokenized_query, history_list, n=args.k)
-
-            history_string = "".join(retrieved_history)
-            prompt = history_string + "\n" + prompt
-            full_prompt = history_string + "\n" + full_prompt
-
+if not args.only_json:
+    for i in tqdm(range(len(train))):
         if args.add_profile:
-            prompt = profile + "\n" + prompt
-            full_prompt = profile + "\n" + full_prompt
+            profile = train_profile[i]['output']
 
-        train_data.append(
-            {
-                "prompt": prompt,
-                "full_prompt": full_prompt
-            }
-        )
+        for idx, q in enumerate(train[i]['query']):
 
-print(train_data)
+            if args.task_name != "citation":
+                article = get_first_k_tokens(extract_article(q['input']), 768)
+                prompt = prompt_template[args.task_name]['prompt'].format(article)
+                full_prompt = prompt_template[args.task_name]['full_prompt'].format(get_first_k_tokens(extract_article(q['input']), 768), q['gold'])
 
-train_dataset = Dataset.from_list(train_data)
-train_dataset = train_dataset.map(generate_and_tokenize_prompt).shuffle()
+            else:
+                question = q['input']
+                article = extract_citation_title(question)
+                option1, option2 = extract_option(question, 1), extract_option(question, 2)
 
-trainer = transformers.Trainer(
-    model=model,
-    train_dataset=train_dataset,
-    args=training_arguments,
-    data_collator=transformers.DataCollatorForSeq2Seq(
-            tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
-    ),
-)
+                prompt = prompt_template[args.task_name]['prompt'].format(article, option1, option2)
+                full_prompt = prompt_template[args.task_name]['full_prompt'].format(article, option1, option2, q['gold'])
 
-for name, module in trainer.model.named_modules():
-    if "norm" in name:
-        module = module.to(torch.float32)
+            if k > 0:
+                visible_history_list = train[i]['profile']
+
+                for p in visible_history_list:
+                    for key, value in p.items():
+                        p[key] = get_first_k_tokens(p[key], 368)
+
+                history_list = [prompt_template[args.task_name]['retrieval_history'].format(**p) for p in visible_history_list]
+                tokenized_corpus = [doc.split(" ") for doc in history_list]
+                bm25 = BM25Okapi(tokenized_corpus)
+
+                tokenized_query = prompt_template[args.task_name]["retrieval_query_wokey"].format(article).split(' ')
+                retrieved_history = bm25.get_top_n(tokenized_query, history_list, n=args.k)
+
+                history_string = "".join(retrieved_history)
+                prompt = history_string + "\n" + prompt
+                full_prompt = history_string + "\n" + full_prompt
+
+            if args.add_profile:
+                prompt = profile + "\n" + prompt
+                full_prompt = profile + "\n" + full_prompt
+
+            train_data.append(
+                {
+                    "prompt": prompt,
+                    "full_prompt": full_prompt
+                }
+            )
+    if is_main_process:
+        print ("--------------example training set------------------")
+        print(train_data[:3])
+
+    train_dataset = Dataset.from_list(train_data)
+    train_dataset = train_dataset.map(generate_and_tokenize_prompt).shuffle()
+
+    trainer = transformers.Trainer(
+        model=model,
+        train_dataset=train_dataset,
+        args=training_arguments,
+        data_collator=transformers.DataCollatorForSeq2Seq(
+                tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
+        ),
+    )
+
+    for name, module in trainer.model.named_modules():
+        if "norm" in name:
+            module = module.to(torch.float32)
 
 
-model.config.use_cache = False  # silence the warnings. Please re-enable for inference!
-trainer.train()
+    model.config.use_cache = False  # silence the warnings. Please re-enable for inference!
+    trainer.train()
 
-if args.add_profile:
-    output_name = "./ckpt/{}/k{}-{}-{}-profile-task_LoRA_ckpt".format(args.task_name, args.k, args.task_name, model_name.split('/')[-1])
+    if args.add_profile:
+        output_name = "./ckpt/{}/k{}-{}-{}-profile-task_LoRA_ckpt".format(args.task_name, args.k, args.task_name, model_name.split('/')[-1])
+    else:
+        output_name = "./ckpt/{}/k{}-{}-{}-task_LoRA_ckpt".format(args.task_name, args.k, args.task_name, model_name.split('/')[-1])
+
+    if is_main_process:
+        model.save_pretrained(output_name)
 else:
-    output_name = "./ckpt/{}/k{}-{}-{}-task_LoRA_ckpt".format(args.task_name, args.k, args.task_name, model_name.split('/')[-1])
-    
-model.save_pretrained(output_name)
+    if args.ckpt_path:
+        model = PeftModel.from_pretrained(base_model, args.ckpt_path)
+    else:
+        if args.add_profile:
+            output_name = "./ckpt/{}/k{}-{}-{}-profile-task_LoRA_ckpt".format(args.task_name, args.k, args.task_name, model_name.split('/')[-1])
+        else:
+            output_name = "./ckpt/{}/k{}-{}-{}-task_LoRA_ckpt".format(args.task_name, args.k, args.task_name, model_name.split('/')[-1])
+        model = PeftModel.from_pretrained(base_model, output_name)
 
+# Inference disabled (training only)
+"""
 model.eval()
 model.config.use_cache = True  # silence the warnings. Please re-enable for inference!
 
@@ -375,9 +404,13 @@ output_file = {
     'model': model_name,
 }
 
+output_dir = f"./output/{args.k}"
+os.makedirs(output_dir, exist_ok=True)
+
 if args.add_profile:
-    with open('./output/{}/output-task-k{}-{}-{}-profile.json'.format(args.k, args.task_name, args.task_name, model_name.split('/')[-1]), 'w') as f:
+    with open(f"{output_dir}/output-task-k{args.k}-{args.task_name}-{model_name.split('/')[-1]}-profile.json", 'w') as f:
         json.dump(output_file, f, indent=4)
 else:
-    with open('./output/{}/output-task-k{}-{}-{}.json'.format(args.k, args.task_name, args.task_name, model_name.split('/')[-1]), 'w') as f:
+    with open(f"{output_dir}/output-task-k{args.k}-{args.task_name}-{model_name.split('/')[-1]}.json", 'w') as f:
         json.dump(output_file, f, indent=4)
+"""

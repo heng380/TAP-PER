@@ -3,17 +3,25 @@ import zipfile
 import glob
 import os
 import shutil
+import re
 
-import os
-
-os.environ['HF_EVALUATE_OFFLINE'] = '1'
-
-import evaluate
+from sklearn.metrics import accuracy_score, f1_score, mean_absolute_error, mean_squared_error
 
 def postprocess_text_classification(preds, labels):
     preds = [str(pred).strip() for pred in preds]
     labels = [str(label).strip() for label in labels]
     return preds, labels
+
+
+def normalize_news_category_prediction(pred):
+    text = str(pred)
+    lower_text = text.lower()
+    marker = "category:"
+    if marker in lower_text:
+        pos = lower_text.rfind(marker)
+        text = text[pos + len(marker):]
+    text = text.strip().splitlines()[0].strip().strip('"').strip()
+    return text
 
 def postprocess_text_generation(preds, labels):
     preds = [pred.strip() for pred in preds]
@@ -22,8 +30,6 @@ def postprocess_text_generation(preds, labels):
     return preds, labels
 
 def create_metric_f1_accuracy(all_labels):
-    f1_metric = evaluate.load("f1")
-    accuracy_metric = evaluate.load("accuracy")
     def create_mapping(x):
         try:
             return all_labels.index(x)
@@ -33,19 +39,27 @@ def create_metric_f1_accuracy(all_labels):
         decoded_preds, decoded_labels = postprocess_text_classification(decoded_preds, decoded_labels)
         decoded_preds = [create_mapping(x) for x in decoded_preds]
         decoded_labels = [create_mapping(x) for x in decoded_labels]
-        result_acc = accuracy_metric.compute(predictions=decoded_preds, references=decoded_labels)
-        result_f1 = f1_metric.compute(predictions=decoded_preds, references=decoded_labels, labels=list(range(len(all_labels))), average = "macro")
-        result = {"accuracy" : result_acc["accuracy"], "f1" : result_f1["f1"]}
+        result_acc = accuracy_score(decoded_labels, decoded_preds)
+        result_f1 = f1_score(
+            decoded_labels,
+            decoded_preds,
+            labels=list(range(len(all_labels))),
+            average="macro",
+            zero_division=0,
+        )
+        result = {"accuracy": result_acc, "f1": result_f1}
         return result
     return compute_metrics
 
 def create_metric_mae_rmse():
-    mse_metric = evaluate.load("mse")
-    mae_metric = evaluate.load("mae")
     def create_mapping(x, y):
+        x_str = str(x).strip()
         try:
-            return float(x)
+            return float(x_str)
         except:
+            score_match = re.search(r"score\s*:\s*([1-5])", x_str, flags=re.IGNORECASE)
+            if score_match:
+                return float(score_match.group(1))
             print(x)
             y = float(y)
             if abs(1 - y) > abs(5 - y):
@@ -54,21 +68,60 @@ def create_metric_mae_rmse():
                 return 5.0
     def compute_metrics(decoded_preds, decoded_labels):
         decoded_preds, decoded_labels = postprocess_text_classification(decoded_preds, decoded_labels)
-        decoded_preds = [create_mapping(x,y) for x,y in zip(decoded_preds, decoded_labels)]
-        decoded_labels = [create_mapping(x,x) for x in decoded_labels]
-        result_mae = mae_metric.compute(predictions=decoded_preds, references=decoded_labels)
-        result_rmse = mse_metric.compute(predictions=decoded_preds, references=decoded_labels, squared = False)
-        result = {"MAE" : result_mae["mae"], "RMSE" : result_rmse["mse"]}
+        decoded_preds = [create_mapping(x, y) for x, y in zip(decoded_preds, decoded_labels)]
+        decoded_labels = [create_mapping(x, x) for x in decoded_labels]
+        result_mae = mean_absolute_error(decoded_labels, decoded_preds)
+        result_rmse = mean_squared_error(decoded_labels, decoded_preds) ** 0.5
+        result = {"MAE": result_mae, "RMSE": result_rmse}
         return result
     return compute_metrics
 
 def create_metric_rouge():
-    rouge_metric = evaluate.load('rouge')
     def compute_metrics(decoded_preds, decoded_labels):
         decoded_preds, decoded_labels = postprocess_text_generation(decoded_preds, decoded_labels)
-        result_rouge = rouge_metric.compute(predictions=decoded_preds, references=decoded_labels)
-        result = {"rouge-1" : result_rouge["rouge1"], "rouge-L" : result_rouge["rougeL"]}
-        return result
+        preds = decoded_preds
+        labels = decoded_labels
+        if not labels:
+            return {"rouge-1": 0.0, "rouge-L": 0.0}
+        rouge_1_total = 0.0
+        rouge_l_total = 0.0
+        for pred_text, label_list in zip(preds, labels):
+            label_text = label_list[0] if label_list else ""
+            headline_match = re.search(r"(?is).*headline:\s*(.*)$", pred_text)
+            title_match = re.search(r"(?is).*title:\s*(.*)$", pred_text)
+            if title_match:
+                pred_text = title_match.group(1).strip()
+            elif headline_match:
+                pred_text = headline_match.group(1).strip()
+            pred_tokens = pred_text.split()
+            label_tokens = label_text.split()
+            if not label_tokens:
+                continue
+            label_counts = {}
+            for token in label_tokens:
+                label_counts[token] = label_counts.get(token, 0) + 1
+            overlap = 0
+            for token in pred_tokens:
+                if label_counts.get(token, 0) > 0:
+                    overlap += 1
+                    label_counts[token] -= 1
+            rouge_1_total += overlap / len(label_tokens)
+
+            m = len(label_tokens)
+            n = len(pred_tokens)
+            dp = [[0] * (n + 1) for _ in range(m + 1)]
+            for i in range(1, m + 1):
+                for j in range(1, n + 1):
+                    if label_tokens[i - 1] == pred_tokens[j - 1]:
+                        dp[i][j] = dp[i - 1][j - 1] + 1
+                    else:
+                        dp[i][j] = dp[i - 1][j] if dp[i - 1][j] >= dp[i][j - 1] else dp[i][j - 1]
+            rouge_l_total += dp[m][n] / m if m else 0.0
+
+        count = len(labels)
+        rouge_1 = rouge_1_total / count if count else 0.0
+        rouge_l = rouge_l_total / count if count else 0.0
+        return {"rouge-1": rouge_1, "rouge-L": rouge_l}
     return compute_metrics
 
 class LaMPEvaluation(object):
@@ -135,7 +188,10 @@ class LaMPEvaluation(object):
 
     def _evaluate_task(self, predictions, task_name):
         golds_dict = {y['id']:y['output'] for y in self.tasks_golds[task_name]}
-        preds_dict = {x['id']:x['output'] for x in predictions}
+        if task_name == "LaMP_2N":
+            preds_dict = {x['id']: normalize_news_category_prediction(x['output']) for x in predictions}
+        else:
+            preds_dict = {x['id']:x['output'] for x in predictions}
         
         gold_ids = self._get_all_gold_ids(task_name)
         pred_ids = self._get_all_ids(predictions)

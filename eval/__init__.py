@@ -1,1 +1,1 @@
-from evaluation import LaMPEvaluation
+from .evaluation import LaMPEvaluation

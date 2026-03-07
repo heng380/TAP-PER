@@ -1,0 +1,44 @@
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Python packaging
+*.egg-info/
+.eggs/
+*.egg
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Model/checkpoint/output artifacts
+ckpt/
+output/
+output_local/
+outputs/
+cache/
+
+# Datasets / large artifacts
+*.arrow
+*.safetensors
+
+# IDE/editor
+.vscode/
+.idea/
+
+# Notebooks
+.ipynb_checkpoints/
+
+data/
+
+output*/
+cache*/
