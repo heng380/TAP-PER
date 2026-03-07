@@ -44,44 +44,53 @@ pip install -r requirements.txt
 ```
 
 ## Experiment ##
-```task_name``` can be selected from ```[citation, movie_tagging, news_categorize, news_headline, product_rating, scholarly_title, tweet_paraphrase]```. Here, we take ```movie_tagging``` as an example.
+```task_name``` can be selected from ```[citation, movie_tagging, news_categorize, news_headline, product_rating, scholarly_title, tweet_paraphrase]```.
 
-### OPPU
-#### 1. Base LLM Task Adaption
+### Three-Stage Training and Evaluation
+
+#### Stage 1: Global memory
+
+Training:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python task_LoRA.py --k 0 --task_name movie_tagging
+torchrun --nproc_per_node=8 task_LoRA.py --task_name news_categorize
 ```
 
-#### 2. Train One PEFT Per User
+Evaluation:
+
 ```bash
-CUDA_VISIBLE_DEVICES=0 python OPPU.py --k 0 --task_name movie_tagging --task_lora ./ckpt/movie_tagging/k0-movie_tagging-Llama-2-7b-hf-task_LoRA_ckpt
+python eval.py --task_name movie_tagging --ckpt_path ./ckpt/movie_tagging/k0-movie_tagging-llama3.1-8B-task_LoRA_ckpt/ --k 1 --add_profile
 ```
 
-### OPPU + RAG
+#### Stage 2: Group memory
 
-#### 1. Base LLM Task Adaption
+Training:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python task_LoRA.py --k 1 --task_name movie_tagging
+python /home/ubuntu/repos/agent/OPPU/cluster_profiles.py --task_name movie_tagging
+
+torchrun --nproc_per_node=8 /home/ubuntu/repos/agent/OPPU/task_LoRA_group.py --task_name citation
 ```
 
-#### 2. Train One PEFT Per User
-```bash
-CUDA_VISIBLE_DEVICES=0 python OPPU.py --k 1 --task_name movie_tagging --task_lora ./ckpt/movie_tagging/k1-movie_tagging-Llama-2-7b-hf-task_LoRA_ckpt
-```
-----
-
-### OPPU + PAG
-#### 1. Base LLM Task Adaption
+Evaluation:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python task_LoRA.py --k 1 --task_name movie_tagging --add_profile
+python /home/ubuntu/repos/agent/OPPU/eval_group.py --task_name citation --k 1 --profile --cuda_id 0
 ```
 
-#### 2. Train One PEFT Per User
+#### Stage 3: Local memory + mediator
+
+Training:
+
 ```bash
-CUDA_VISIBLE_DEVICES=0 python OPPU.py --k 1 --task_name movie_tagging --task_lora ./ckpt/movie_tagging/k1-movie_tagging-Llama-2-7b-hf-profile-task_LoRA_ckpt --add_profile
+torchrun --nproc_per_node=8 /home/ubuntu/repos/agent/OPPU/task_LoRA_local_memory.py --task_name citation --group_mode 1
+```
+
+Evaluation:
+
+```bash
+python /home/ubuntu/repos/agent/OPPU/eval_local.py --task_name citation --k 1
+python eval_local.py --task_name product_rating --group_mode 1
 ```
 
 ## Evaluation ##
