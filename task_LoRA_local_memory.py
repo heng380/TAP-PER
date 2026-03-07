@@ -29,7 +29,6 @@ parser.add_argument('--local_rank', type=int, default=-1, help='Local rank for D
 parser.add_argument('--group_mapping_file', type=str, default='')
 parser.add_argument('--num_groups', type=int, default=5)
 parser.add_argument('--task_ckpt_path', type=str, default='', help='Optional override for task LoRA ckpt (default: k0 task ckpt)')
-parser.add_argument('--group_mode', type=int, default=0, help='0: use group2 OPPU LoRA, 1: use group task LoRA')
 parser.add_argument('--local_lora_r', type=int, default=8)
 parser.add_argument('--local_lora_alpha', type=int, default=16)
 parser.add_argument('--local_lora_dropout', type=float, default=0.05)
@@ -255,17 +254,7 @@ def resolve_task_ckpt_path(task_name, model_name):
     return f"./ckpt/{task_name}/k0-{task_name}-{model_short}-task_LoRA_ckpt"
 
 
-def resolve_group2_ckpt_path(task_name, model_name, group_id):
-    model_short = model_name.split('/')[-1]
-    return f"./ckpt/{task_name}/k0-{task_name}-{model_short}-group{group_id}-OPPU-task_LoRA_ckpt"
-
-
-def resolve_group_task_ckpt_path(task_name, model_name, group_id):
-    model_short = model_name.split('/')[-1]
-    return f"./ckpt/{task_name}/k0-{task_name}-{model_short}-group{group_id}-task_LoRA_ckpt"
-
-
-def create_frozen_backbone_and_tokenizer(group_id):
+def create_frozen_backbone_and_tokenizer():
     tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left", token=args.access_token)
     if tokenizer.eos_token is None:
         tokenizer.eos_token = "</s>"
@@ -290,26 +279,15 @@ def create_frozen_backbone_and_tokenizer(group_id):
     base_model.config.bos_token_id = tokenizer.bos_token_id
 
     task_ckpt = args.task_ckpt_path or resolve_task_ckpt_path(task_name, model_name)
-    if args.group_mode == 1:
-        group_ckpt = resolve_group_task_ckpt_path(task_name, model_name, group_id)
-        group_ckpt_type = "group task"
-    else:
-        group_ckpt = resolve_group2_ckpt_path(task_name, model_name, group_id)
-        group_ckpt_type = "group2 OPPU"
 
     if not os.path.exists(task_ckpt):
         raise FileNotFoundError(f"Task LoRA checkpoint not found: {task_ckpt}")
-    if not os.path.exists(group_ckpt):
-        raise FileNotFoundError(f"{group_ckpt_type} LoRA checkpoint not found: {group_ckpt}")
 
     task_model = PeftModel.from_pretrained(base_model, task_ckpt, is_trainable=False)
     merged_task_model = task_model.merge_and_unload()
 
-    group_model = PeftModel.from_pretrained(merged_task_model, group_ckpt, is_trainable=False)
-    merged_group_model = group_model.merge_and_unload()
-
-    merged_group_model.gradient_checkpointing_enable()
-    return merged_group_model, tokenizer, task_ckpt, group_ckpt, group_ckpt_type
+    merged_task_model.gradient_checkpointing_enable()
+    return merged_task_model, tokenizer, task_ckpt
 
 
 def print_trainable_parameters(model):
@@ -418,7 +396,7 @@ for group_id in range(args.num_groups):
                 print(f"prompt:\n{train_data[preview_idx]['prompt']}")
                 print(f"full_prompt:\n{train_data[preview_idx]['full_prompt']}")
 
-        _, tokenizer_for_cache, _, _, _ = create_frozen_backbone_and_tokenizer(group_id)
+        _, tokenizer_for_cache, _ = create_frozen_backbone_and_tokenizer()
         generate_and_tokenize_prompt_for_cache = create_tokenizers(tokenizer_for_cache)
         train_dataset = Dataset.from_list(train_data)
         train_dataset = train_dataset.map(generate_and_tokenize_prompt_for_cache, num_proc=args.map_num_proc)
@@ -435,7 +413,7 @@ for group_id in range(args.num_groups):
         continue
 
     try:
-        frozen_model, tokenizer, task_ckpt_path, group_ckpt_path, group_ckpt_type = create_frozen_backbone_and_tokenizer(group_id)
+        frozen_model, tokenizer, task_ckpt_path = create_frozen_backbone_and_tokenizer()
     except FileNotFoundError as e:
         if is_main_process:
             print(f"Skip group {group_id}: {e}")
@@ -455,7 +433,6 @@ for group_id in range(args.num_groups):
 
     if is_main_process:
         print(f"Loaded frozen task base: {task_ckpt_path}")
-        print(f"Loaded frozen {group_ckpt_type} base: {group_ckpt_path}")
         print_trainable_parameters(model)
 
     trainer = transformers.Trainer(
@@ -491,8 +468,6 @@ for group_id in range(args.num_groups):
             "k": args.k,
             "add_profile": args.add_profile,
             "base_task_ckpt": task_ckpt_path,
-            "base_group_ckpt": group_ckpt_path,
-            "base_group_ckpt_type": group_ckpt_type,
             "hidden_size": hidden_size,
             "prefix_len": args.prefix_len,
             "local_lora_path": local_lora_output,

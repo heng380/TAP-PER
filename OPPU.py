@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import bitsandbytes as bnb
 from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
 # from transformers import pipeline, BitsAndBytesConfig
 import argparse
@@ -15,7 +14,7 @@ from peft import LoraConfig, get_peft_model, PeftModel
 
 
 parser = argparse.ArgumentParser(description="Parser for LoRA")
-parser.add_argument('--model_name', type=str, default='meta-llama/Llama-2-7b-hf')
+parser.add_argument('--model_name', type=str, default='/cfs/models/llama/llama3.1-8B')
 parser.add_argument('--batch_size', type=int, default=16)
 parser.add_argument('--k', type=int, default=0)
 parser.add_argument('--max_step', type=int, default=5000)
@@ -24,7 +23,7 @@ parser.add_argument('--max_epoch', type=int, default=2)
 parser.add_argument('--temperature', type=float, default=0.1)
 parser.add_argument('--task_name', type=str, default='movie_tagging')
 parser.add_argument('--add_profile', action='store_true')
-parser.add_argument('--task_lora', type=str, default='./ckpt/movie_tagging/k1-movie_tagging-Llama-2-7b-hf-task_LoRA_ckpt')
+parser.add_argument('--task_lora', type=str, default='/home/ubuntu/repos/agent/OPPU/ckpt/movie_tagging/k0-movie_tagging-llama3.1-8B-task_LoRA_ckpt')
 parser.add_argument('--access_token', type=str, default=None)
 
 args = parser.parse_args()
@@ -65,10 +64,12 @@ max_epoch = args.max_epoch
 # )
 
 tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left", token=args.access_token)
-tokenizer.eos_token = "</s>"
-tokenizer.pad_token = '[PAD]'
-# tokenizer.pad_token = tokenizer.eos_token
-tokenizer.pad_token_id = tokenizer.eos_token_id
+if tokenizer.eos_token is None:
+    tokenizer.eos_token = "</s>"
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token or "[PAD]"
+if tokenizer.pad_token_id is None:
+    tokenizer.pad_token_id = tokenizer.eos_token_id
 
 
 base_model = AutoModelForCausalLM.from_pretrained(
