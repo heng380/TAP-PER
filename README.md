@@ -5,15 +5,6 @@ This is source code of our EMNLP 2024 paper
 
 [**Democratizing Large Language Models via Personalized Parameter-Efficient Fine-tuning**](https://arxiv.org/abs/2402.04401).
 
-by
-[Zhaoxuan Tan](https://zhaoxuan.info/), 
-[Qingkai Zeng](https://qingkaizeng.github.io/), 
-[Yijun Tian](http://tianyijun.com/), 
-[Zheyuan Liu](https://franciscoliu.github.io/), 
-[Bing Yin](https://scholar.google.com/citations?user=qSOxydEAAAAJ&hl=en), 
-[Meng Jiang](http://www.meng-jiang.com/).
-
-
 
 ## Overview ##
 
@@ -53,13 +44,13 @@ pip install -r requirements.txt
 Training:
 
 ```bash
-torchrun --nproc_per_node=8 task_LoRA.py --task_name news_categorize
+torchrun --nproc_per_node=8 task_LoRA.py --task_name movie_tagging
 ```
 
 Evaluation:
 
 ```bash
-python eval.py --task_name movie_tagging --ckpt_path ./ckpt/movie_tagging/k0-movie_tagging-llama3.1-8B-task_LoRA_ckpt/ --k 1 --add_profile
+python eval.py --task_name movie_tagging --ckpt_path ./ckpt/movie_tagging/k0-movie_tagging-llama3.1-8B-task_LoRA_ckpt/ --k 1 --profile
 ```
 
 #### Stage 2: Group memory
@@ -69,13 +60,13 @@ Training:
 ```bash
 python /home/ubuntu/repos/agent/OPPU/cluster_profiles.py --task_name movie_tagging
 
-torchrun --nproc_per_node=8 /home/ubuntu/repos/agent/OPPU/task_LoRA_group.py --task_name citation
+torchrun --nproc_per_node=8 /home/ubuntu/repos/agent/OPPU/task_LoRA_group.py --task_name movie_tagging
 ```
 
 Evaluation:
 
 ```bash
-python /home/ubuntu/repos/agent/OPPU/eval_group.py --task_name citation --k 1 --profile --cuda_id 0
+python /home/ubuntu/repos/agent/OPPU/eval_group.py --task_name movie_tagging --k 1 --profile
 ```
 
 #### Stage 3: Local memory + mediator
@@ -83,25 +74,13 @@ python /home/ubuntu/repos/agent/OPPU/eval_group.py --task_name citation --k 1 --
 Training:
 
 ```bash
-torchrun --nproc_per_node=8 /home/ubuntu/repos/agent/OPPU/task_LoRA_local_memory.py --task_name citation --group_mode 1
+torchrun --nproc_per_node=8 /home/ubuntu/repos/agent/OPPU/task_LoRA_local_memory.py --task_name movie_tagging --group_mode 1
 ```
 
 Evaluation:
 
 ```bash
-python /home/ubuntu/repos/agent/OPPU/eval_local.py --task_name citation --k 1
-python eval_local.py --task_name product_rating --group_mode 1
-```
-
-## Evaluation ##
-```TASK_ID``` is the corresponding ID selected from ```["LaMP_1", "LaMP_2N", "LaMP_2M", "LaMP_3", "LaMP_4", "LaMP_5", "LaMP_7"]```
-
-```bash
-python ./eval/eval_task.py \
-    --golds_json {PATH_TO_LABEL_JSON_FILE} \
-    --preds_json {PATH_TO_PREDICTION_JSON_FILE} \
-    --task_name {TASK_ID} \
-    --output_file {RESULT_JSON_PATH}
+python /home/ubuntu/repos/agent/OPPU/eval_local.py --task_name movie_tagging --group_mode 1
 ```
 
 ## Citation ##
