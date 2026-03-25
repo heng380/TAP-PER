@@ -108,6 +108,9 @@ def get_first_k_tokens(text, k):
     :param k: The number of tokens to extract.
     :return: The first k tokens of the text string.
     """
+    if not isinstance(text, str):
+        text = str(text)
+
     # Split the text into tokens based on whitespace
     tokens = text.split()
     output = " ".join(tokens[:k])

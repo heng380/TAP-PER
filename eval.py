@@ -70,10 +70,13 @@ def main():
     base_model.config.eos_token_id = tokenizer.eos_token_id
     base_model.config.bos_token_id = tokenizer.bos_token_id
 
-    if args.ckpt_path:
-        model = PeftModel.from_pretrained(base_model, args.ckpt_path)
-    else:
-        model = base_model
+    if not args.ckpt_path:
+        args.ckpt_path = f"./ckpt/{task_name}/k0-{task_name}-{model_name.split('/')[-1]}-task_LoRA_ckpt"
+
+    if not os.path.exists(args.ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found: {args.ckpt_path}")
+
+    model = PeftModel.from_pretrained(base_model, args.ckpt_path)
 
     model.eval()
     model.config.use_cache = True

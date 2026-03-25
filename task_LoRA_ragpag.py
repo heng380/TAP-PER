@@ -625,6 +625,8 @@ def print_trainable_parameters(model):
         print(f"trainable params: {trainable} || all params: {total} || trainable%: {ratio:.4f}")
 
 
+effective_lr = TASK_TRAIN_OVERRIDES.get(args.task_name, {}).get("learning_rate", 2e-4)
+
 training_arguments = transformers.TrainingArguments(
     output_dir='./ckpt/trainer_tmp_rp/',
     per_device_train_batch_size=batch_size,
@@ -633,7 +635,7 @@ training_arguments = transformers.TrainingArguments(
     num_train_epochs=max_epoch,
     save_steps=1e9,
     logging_steps=10,
-    learning_rate=2e-4,
+    learning_rate=effective_lr,
     weight_decay=1e-2,
     bf16=True,
     max_grad_norm=0.3,

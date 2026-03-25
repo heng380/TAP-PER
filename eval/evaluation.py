@@ -5,7 +5,6 @@ import os
 import shutil
 import re
 
-from sklearn.metrics import accuracy_score, f1_score, mean_absolute_error, mean_squared_error
 
 def postprocess_text_classification(preds, labels):
     preds = [str(pred).strip() for pred in preds]
@@ -30,12 +29,21 @@ def postprocess_text_generation(preds, labels):
     return preds, labels
 
 def create_metric_f1_accuracy(all_labels):
+    def normalize_label(x):
+        s = str(x).strip()
+        if all_labels == ["[1]", "[2]"] and s in ["1", "2"]:
+            return f"[{s}]"
+        return s
+
     def create_mapping(x):
+        x = normalize_label(x)
         try:
             return all_labels.index(x)
         except:
             return -1
     def compute_metrics(decoded_preds, decoded_labels):
+        from sklearn.metrics import accuracy_score, f1_score
+
         decoded_preds, decoded_labels = postprocess_text_classification(decoded_preds, decoded_labels)
         decoded_preds = [create_mapping(x) for x in decoded_preds]
         decoded_labels = [create_mapping(x) for x in decoded_labels]
@@ -67,6 +75,8 @@ def create_metric_mae_rmse():
             else:
                 return 5.0
     def compute_metrics(decoded_preds, decoded_labels):
+        from sklearn.metrics import mean_absolute_error, mean_squared_error
+
         decoded_preds, decoded_labels = postprocess_text_classification(decoded_preds, decoded_labels)
         decoded_preds = [create_mapping(x, y) for x, y in zip(decoded_preds, decoded_labels)]
         decoded_labels = [create_mapping(x, x) for x in decoded_labels]
@@ -77,51 +87,18 @@ def create_metric_mae_rmse():
     return compute_metrics
 
 def create_metric_rouge():
+    import evaluate
+
+    rouge_metric_path = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", "..", "collective_memory", "PROPER", "evaluation", "utils", "rouge.py")
+    )
+    rouge_metric = evaluate.load(rouge_metric_path)
+
     def compute_metrics(decoded_preds, decoded_labels):
         decoded_preds, decoded_labels = postprocess_text_generation(decoded_preds, decoded_labels)
-        preds = decoded_preds
-        labels = decoded_labels
-        if not labels:
-            return {"rouge-1": 0.0, "rouge-L": 0.0}
-        rouge_1_total = 0.0
-        rouge_l_total = 0.0
-        for pred_text, label_list in zip(preds, labels):
-            label_text = label_list[0] if label_list else ""
-            headline_match = re.search(r"(?is).*headline:\s*(.*)$", pred_text)
-            title_match = re.search(r"(?is).*title:\s*(.*)$", pred_text)
-            if title_match:
-                pred_text = title_match.group(1).strip()
-            elif headline_match:
-                pred_text = headline_match.group(1).strip()
-            pred_tokens = pred_text.split()
-            label_tokens = label_text.split()
-            if not label_tokens:
-                continue
-            label_counts = {}
-            for token in label_tokens:
-                label_counts[token] = label_counts.get(token, 0) + 1
-            overlap = 0
-            for token in pred_tokens:
-                if label_counts.get(token, 0) > 0:
-                    overlap += 1
-                    label_counts[token] -= 1
-            rouge_1_total += overlap / len(label_tokens)
+        result_rouge = rouge_metric.compute(predictions=decoded_preds, references=decoded_labels)
+        return {"rouge-1": result_rouge["rouge1"], "rouge-L": result_rouge["rougeL"]}
 
-            m = len(label_tokens)
-            n = len(pred_tokens)
-            dp = [[0] * (n + 1) for _ in range(m + 1)]
-            for i in range(1, m + 1):
-                for j in range(1, n + 1):
-                    if label_tokens[i - 1] == pred_tokens[j - 1]:
-                        dp[i][j] = dp[i - 1][j - 1] + 1
-                    else:
-                        dp[i][j] = dp[i - 1][j] if dp[i - 1][j] >= dp[i][j - 1] else dp[i][j - 1]
-            rouge_l_total += dp[m][n] / m if m else 0.0
-
-        count = len(labels)
-        rouge_1 = rouge_1_total / count if count else 0.0
-        rouge_l = rouge_l_total / count if count else 0.0
-        return {"rouge-1": rouge_1, "rouge-L": rouge_l}
     return compute_metrics
 
 class LaMPEvaluation(object):

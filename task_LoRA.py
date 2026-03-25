@@ -15,7 +15,7 @@ from tqdm import tqdm
 
 parser = argparse.ArgumentParser(description="Parser for LoRA")
 parser.add_argument('--model_name', type=str, default='/cfs/models/llama/llama3.1-8B')
-parser.add_argument('--batch_size', type=int, default=8)
+parser.add_argument('--batch_size', type=int, default=1)
 parser.add_argument('--k', type=int, default=0)
 parser.add_argument('--max_step', type=int, default=5000)
 parser.add_argument('--cut_off', type=int, default=2048)
@@ -108,8 +108,8 @@ from peft import LoraConfig, get_peft_model, PeftModel
 
 peft_config = LoraConfig(
     r=8,
-    lora_alpha=8,
-    target_modules=["q_proj", "v_proj", "k_proj", "out_proj"],
+    lora_alpha=16,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
     lora_dropout=0.05,
     bias="none",
     task_type="CAUSAL_LM"
@@ -122,17 +122,19 @@ training_arguments = transformers.TrainingArguments(
     optim='adamw_torch',
     num_train_epochs=max_epoch,
     save_steps=1e9,
-    logging_steps=50,
-    learning_rate=1e-4,
-    weight_decay=1e-2,
+    logging_steps=20,
+    learning_rate=3e-4,
+    weight_decay=0.1,
     bf16=True,
     max_grad_norm=0.3,
-    # max_steps=max_step,
-    warmup_ratio=0.1,
+    max_steps=-1,
+    warmup_ratio=0.03,
     group_by_length=True,
     lr_scheduler_type='linear',
     report_to='none',
     ddp_find_unused_parameters=False,
+    gradient_checkpointing=True,
+    save_strategy="no"
 )
 
 
@@ -250,7 +252,8 @@ if not args.only_json:
 
                 for p in visible_history_list:
                     for key, value in p.items():
-                        p[key] = get_first_k_tokens(p[key], 368)
+                        if isinstance(value, str):
+                            p[key] = get_first_k_tokens(value, 368)
 
                 history_list = [prompt_template[args.task_name]['retrieval_history'].format(**p) for p in visible_history_list]
                 tokenized_corpus = [doc.split(" ") for doc in history_list]
@@ -327,7 +330,8 @@ for i in tqdm(range(len(test_data))):
         visible_history_list = test_data[i]['profile']
         for p in visible_history_list:
             for key, value in p.items():
-                p[key] = get_first_k_tokens(p[key], 368)
+                if isinstance(value, str):
+                    p[key] = get_first_k_tokens(value, 368)
 
         history_list = [prompt_template[args.task_name]['retrieval_history'].format(**p) for p in visible_history_list]
 
