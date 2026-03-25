@@ -1,0 +1,566 @@
+import argparse
+import json
+import os
+from string import Formatter
+
+import torch
+import torch.nn as nn
+import transformers
+from datasets import Dataset, load_from_disk
+from peft import PeftModel, LoraConfig, get_peft_model
+from rank_bm25 import BM25Okapi
+from tqdm import tqdm
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from utils import get_first_k_tokens
+
+
+parser = argparse.ArgumentParser(description="Train RAG-prefix + LoRA on profile records")
+parser.add_argument('--model_name', type=str, default='/cfs/models/llama/llama3.1-8B')
+parser.add_argument('--batch_size', type=int, default=1)
+parser.add_argument('--k', type=int, default=10, help='Top-k records for RAG-prefix attention')
+parser.add_argument('--cut_off', type=int, default=2048)
+parser.add_argument('--max_epoch', type=int, default=3)
+parser.add_argument('--prefix_len', type=int, default=8)
+parser.add_argument('--task_name', type=str, default='movie_tagging')
+parser.add_argument('--add_profile', action='store_true')
+parser.add_argument('--access_token', type=str, default=None)
+parser.add_argument('--local_rank', type=int, default=-1, help='Local rank for DDP')
+parser.add_argument('--task_ckpt_path', type=str, default='', help='Optional override for task LoRA ckpt (default: k0 task ckpt)')
+parser.add_argument('--rag_lora_r', type=int, default=4)
+parser.add_argument('--rag_lora_alpha', type=int, default=8)
+parser.add_argument('--rag_lora_dropout', type=float, default=0.05)
+parser.add_argument('--query_max_len', type=int, default=128)
+parser.add_argument('--record_max_len', type=int, default=128)
+parser.add_argument('--preprocess_only', action='store_true')
+parser.add_argument('--cache_dir', type=str, default='./cache_rag')
+parser.add_argument('--map_num_proc', type=int, default=8)
+args = parser.parse_args()
+
+if args.local_rank == -1 and "LOCAL_RANK" in os.environ:
+    args.local_rank = int(os.environ["LOCAL_RANK"])
+if args.local_rank != -1:
+    torch.cuda.set_device(args.local_rank)
+
+is_main_process = args.local_rank in (-1, 0)
+model_name = args.model_name
+task_name = args.task_name
+batch_size = args.batch_size
+k = args.k
+cutoff_len = args.cut_off
+add_eos_token = False
+max_epoch = args.max_epoch
+
+with open(f"./data/{task_name}/user_top_100_history.json", 'r') as f:
+    train = json.load(f)
+
+with open('./prompt/prompt.json', 'r') as f:
+    prompt_template = json.load(f)
+
+format_flag = False
+if args.task_name in ["movie_tagging", "news_categorize", "news_headline", "product_rating", "scholarly_title"]:
+    format_flag = True
+
+profile_by_user_id = {}
+if args.add_profile:
+    with open(f'./data/{task_name}/profile_user_100.json', 'r') as f:
+        train_profile = json.load(f)
+    for item in train_profile:
+        if "id" in item:
+            profile_by_user_id[int(item["id"])] = item.get("output", "")
+
+
+def safe_truncate_dict(record, limit=768):
+    out = {}
+    for key, value in record.items():
+        if isinstance(value, str):
+            out[key] = get_first_k_tokens(value, limit)
+        else:
+            out[key] = value
+    return out
+
+
+def format_with_required_fields(template_str, values):
+    required_keys = {
+        field_name
+        for _, field_name, _, _ in Formatter().parse(template_str)
+        if field_name is not None and field_name != ""
+    }
+    format_values = {key: values.get(key, "") for key in required_keys}
+    return template_str.format(**format_values)
+
+
+def build_prompt_pair(idx, profile_item, user_history, profile_text):
+    q = safe_truncate_dict(profile_item, limit=768)
+
+    oppu_input_template = prompt_template[args.task_name]['OPPU_input']
+    oppu_full_template = prompt_template[args.task_name]['OPPU_full']
+
+    prompt = format_with_required_fields(oppu_input_template, q)
+    full_prompt = format_with_required_fields(oppu_full_template, q)
+
+    retrieval_query_template = prompt_template[args.task_name].get('retrieval_query', None)
+    if retrieval_query_template is not None:
+        query_text = format_with_required_fields(retrieval_query_template, q)
+    else:
+        query_text = prompt
+
+    retrieved_texts = []
+    if k > 0 and idx != 0 and format_flag:
+        visible_history_list = [safe_truncate_dict(h, limit=768) for h in user_history[:idx]]
+        history_list = [prompt_template[args.task_name]['retrieval_history'].format(**p) for p in visible_history_list]
+
+        if len(history_list) > 0:
+            tokenized_corpus = [doc.split(" ") for doc in history_list]
+            bm25 = BM25Okapi(tokenized_corpus)
+            tokenized_query = query_text.split(' ')
+            top_n = min(args.k, len(history_list))
+            retrieved_texts = bm25.get_top_n(tokenized_query, history_list, n=top_n)
+
+    if args.add_profile and format_flag:
+        prompt = profile_text + "\n" + prompt
+        full_prompt = profile_text + "\n" + full_prompt
+
+    return prompt, full_prompt, query_text, retrieved_texts
+
+
+def build_train_data(users):
+    train_data = []
+    for sample in tqdm(users, disable=not is_main_process):
+        uid = int(sample['user_id'])
+        profile_text = profile_by_user_id.get(uid, "") if args.add_profile else ""
+
+        for idx, profile_item in enumerate(sample['profile']):
+            prompt, full_prompt, query_text, retrieved_texts = build_prompt_pair(
+                idx, profile_item, sample['profile'], profile_text
+            )
+            train_data.append({
+                "prompt": prompt,
+                "full_prompt": full_prompt,
+                "query_text": query_text,
+                "retrieved_texts": retrieved_texts,
+            })
+    return train_data
+
+
+def create_tokenizers(tokenizer):
+    def tokenize(prompt, add_eos_token=True):
+        result = tokenizer(
+            prompt,
+            truncation=True,
+            max_length=cutoff_len,
+            padding=False,
+            return_tensors=None,
+        )
+        if (
+            result["input_ids"][-1] != tokenizer.eos_token_id
+            and len(result["input_ids"]) < cutoff_len
+            and add_eos_token
+        ):
+            result["input_ids"].append(tokenizer.eos_token_id)
+            result["attention_mask"].append(1)
+
+        result["labels"] = result["input_ids"].copy()
+        return result
+
+    def generate_and_tokenize_prompt(data_point):
+        full_prompt = data_point['full_prompt']
+        tokenized_full_prompt = tokenize(full_prompt)
+        user_prompt = data_point['prompt']
+
+        tokenized_user_prompt = tokenize(user_prompt, add_eos_token=add_eos_token)
+        user_prompt_len = len(tokenized_user_prompt["input_ids"])
+
+        if add_eos_token:
+            user_prompt_len -= 1
+
+        tokenized_full_prompt["labels"] = [
+            -100
+        ] * user_prompt_len + tokenized_full_prompt["labels"][user_prompt_len:]
+
+        tokenized_full_prompt["query_text"] = data_point["query_text"]
+        tokenized_full_prompt["retrieved_texts"] = data_point["retrieved_texts"]
+        return tokenized_full_prompt
+
+    return generate_and_tokenize_prompt
+
+
+def resolve_task_ckpt_path(task_name, model_name):
+    model_short = model_name.split('/')[-1]
+    return f"./ckpt/{task_name}/k0-{task_name}-{model_short}-task_LoRA_ckpt"
+
+
+def create_frozen_backbone_and_tokenizer():
+    tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side="left", token=args.access_token)
+    if tokenizer.eos_token is None:
+        tokenizer.eos_token = "</s>"
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token or "[PAD]"
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    base_model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        local_files_only=False,
+        device_map=None,
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+    )
+    if args.local_rank != -1:
+        base_model = base_model.to(torch.device("cuda", args.local_rank))
+
+    base_model.config.use_cache = False
+    base_model.config.pad_token_id = tokenizer.pad_token_id
+    base_model.config.eos_token_id = tokenizer.eos_token_id
+    base_model.config.bos_token_id = tokenizer.bos_token_id
+
+    task_ckpt = args.task_ckpt_path or resolve_task_ckpt_path(task_name, model_name)
+
+    if not os.path.exists(task_ckpt):
+        raise FileNotFoundError(f"Task LoRA checkpoint not found: {task_ckpt}")
+
+    task_model = PeftModel.from_pretrained(base_model, task_ckpt, is_trainable=False)
+    merged_task_model = task_model.merge_and_unload()
+
+    merged_task_model.gradient_checkpointing_enable()
+    return merged_task_model, tokenizer, task_ckpt
+
+
+class RagPrefixModel(nn.Module):
+    def __init__(self, base_model, hidden_size, prefix_len):
+        super().__init__()
+        self.base_model = base_model
+        self.prefix_len = prefix_len
+        self.hidden_size = hidden_size
+
+        self.attn_mlp = nn.Sequential(
+            nn.Linear(hidden_size * 4, hidden_size),
+            nn.GELU(),
+            nn.Linear(hidden_size, 1),
+        )
+        self.prefix_proj = nn.Linear(hidden_size, hidden_size * prefix_len)
+
+    def _mean_pool_embeds(self, input_ids, attention_mask):
+        embeds = self.base_model.get_input_embeddings()(input_ids)
+        mask = attention_mask.unsqueeze(-1).to(embeds.dtype)
+        summed = (embeds * mask).sum(dim=1)
+        denom = mask.sum(dim=1).clamp_min(1.0)
+        return summed / denom
+
+    def _build_rag_prefix(
+        self,
+        query_input_ids,
+        query_attention_mask,
+        record_input_ids,
+        record_attention_mask,
+        record_valid_mask,
+    ):
+        batch_size = query_input_ids.size(0)
+        top_k = record_input_ids.size(1)
+        rec_len = record_input_ids.size(2)
+
+        q_vec = self._mean_pool_embeds(query_input_ids, query_attention_mask)
+        rec_vec = self._mean_pool_embeds(
+            record_input_ids.reshape(batch_size * top_k, rec_len),
+            record_attention_mask.reshape(batch_size * top_k, rec_len),
+        ).reshape(batch_size, top_k, self.hidden_size)
+
+        q_expand = q_vec.unsqueeze(1).expand_as(rec_vec)
+        feat = torch.cat([q_expand, rec_vec, q_expand - rec_vec, q_expand * rec_vec], dim=-1)
+        scores = self.attn_mlp(feat).squeeze(-1)
+
+        valid = record_valid_mask.to(scores.dtype)
+        scores = scores.masked_fill(valid == 0, -1e4)
+        attn = torch.softmax(scores, dim=-1)
+        attn = attn * valid
+        attn = attn / attn.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+
+        context = (attn.unsqueeze(-1) * rec_vec).sum(dim=1)
+        prefix = self.prefix_proj(context).view(batch_size, self.prefix_len, self.hidden_size)
+        return prefix
+
+    def forward(
+        self,
+        input_ids=None,
+        attention_mask=None,
+        labels=None,
+        query_input_ids=None,
+        query_attention_mask=None,
+        record_input_ids=None,
+        record_attention_mask=None,
+        record_valid_mask=None,
+        **kwargs,
+    ):
+        if input_ids is None:
+            raise ValueError("input_ids is required")
+
+        token_embeds = self.base_model.get_input_embeddings()(input_ids)
+
+        if (
+            query_input_ids is None
+            or query_attention_mask is None
+            or record_input_ids is None
+            or record_attention_mask is None
+            or record_valid_mask is None
+        ):
+            prefix_embeds = torch.zeros(
+                token_embeds.size(0),
+                self.prefix_len,
+                token_embeds.size(-1),
+                dtype=token_embeds.dtype,
+                device=token_embeds.device,
+            )
+        else:
+            prefix_embeds = self._build_rag_prefix(
+                query_input_ids=query_input_ids,
+                query_attention_mask=query_attention_mask,
+                record_input_ids=record_input_ids,
+                record_attention_mask=record_attention_mask,
+                record_valid_mask=record_valid_mask,
+            )
+
+        inputs_embeds = torch.cat([prefix_embeds, token_embeds], dim=1)
+
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+        prefix_mask = torch.ones(
+            (attention_mask.size(0), self.prefix_len),
+            dtype=attention_mask.dtype,
+            device=attention_mask.device,
+        )
+        merged_attention_mask = torch.cat([prefix_mask, attention_mask], dim=1)
+
+        if labels is not None:
+            prefix_labels = torch.full(
+                (labels.size(0), self.prefix_len),
+                -100,
+                dtype=labels.dtype,
+                device=labels.device,
+            )
+            labels = torch.cat([prefix_labels, labels], dim=1)
+
+        return self.base_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=merged_attention_mask,
+            labels=labels,
+            **kwargs,
+        )
+
+
+class RagPrefixCollator:
+    def __init__(self, tokenizer, rag_k, query_max_len=128, record_max_len=128):
+        self.tokenizer = tokenizer
+        self.rag_k = max(1, rag_k)
+        self.query_max_len = query_max_len
+        self.record_max_len = record_max_len
+        self.inner_collator = transformers.DataCollatorForSeq2Seq(
+            tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
+        )
+
+    def __call__(self, features):
+        query_texts = [str(f.get("query_text", "")) for f in features]
+
+        record_texts_flat = []
+        valid_mask = []
+        for f in features:
+            recs = f.get("retrieved_texts", [])
+            if not isinstance(recs, list):
+                recs = []
+            recs = [str(r) for r in recs][: self.rag_k]
+            recs = recs + [""] * (self.rag_k - len(recs))
+
+            for rec in recs:
+                record_texts_flat.append(rec)
+                valid_mask.append(1 if rec.strip() else 0)
+
+        stripped = []
+        for f in features:
+            item = dict(f)
+            item.pop("query_text", None)
+            item.pop("retrieved_texts", None)
+            stripped.append(item)
+
+        batch = self.inner_collator(stripped)
+
+        query_tokens = self.tokenizer(
+            query_texts,
+            padding=True,
+            truncation=True,
+            max_length=self.query_max_len,
+            return_tensors="pt",
+        )
+        rec_tokens = self.tokenizer(
+            record_texts_flat,
+            padding=True,
+            truncation=True,
+            max_length=self.record_max_len,
+            return_tensors="pt",
+        )
+
+        batch_size = len(features)
+        batch["query_input_ids"] = query_tokens["input_ids"]
+        batch["query_attention_mask"] = query_tokens["attention_mask"]
+
+        batch["record_input_ids"] = rec_tokens["input_ids"].view(batch_size, self.rag_k, -1)
+        batch["record_attention_mask"] = rec_tokens["attention_mask"].view(batch_size, self.rag_k, -1)
+        batch["record_valid_mask"] = torch.tensor(valid_mask, dtype=torch.long).view(batch_size, self.rag_k)
+        return batch
+
+
+def print_trainable_parameters(model):
+    trainable, total = 0, 0
+    for p in model.parameters():
+        total += p.numel()
+        if p.requires_grad:
+            trainable += p.numel()
+    if is_main_process:
+        ratio = 100 * trainable / total if total > 0 else 0
+        print(f"trainable params: {trainable} || all params: {total} || trainable%: {ratio:.4f}")
+
+
+def build_rag_lora_config():
+    return LoraConfig(
+        r=args.rag_lora_r,
+        lora_alpha=args.rag_lora_alpha,
+        target_modules=["q_proj", "v_proj", "k_proj", "out_proj"],
+        lora_dropout=args.rag_lora_dropout,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+
+
+training_arguments = transformers.TrainingArguments(
+    output_dir='./ckpt/trainer_tmp_rag/',
+    per_device_train_batch_size=batch_size,
+    gradient_accumulation_steps=1,
+    optim='adamw_torch',
+    num_train_epochs=max_epoch,
+    save_steps=1e9,
+    logging_steps=10,
+    learning_rate=1e-5,
+    weight_decay=1e-2,
+    bf16=True,
+    max_grad_norm=0.3,
+    warmup_ratio=0.1,
+    group_by_length=True,
+    lr_scheduler_type='linear',
+    report_to='none',
+    local_rank=args.local_rank,
+    ddp_find_unused_parameters=False,
+    save_strategy="no",
+)
+
+users = train
+if is_main_process:
+    print(f"Loaded train users (top100): {len(users)}")
+
+cache_path = os.path.join(
+    args.cache_dir,
+    args.task_name,
+    f"k{args.k}{'-profile' if args.add_profile else ''}",
+)
+
+train_dataset = None
+if os.path.exists(cache_path):
+    if is_main_process:
+        print(f"Load cached dataset: {cache_path}")
+    train_dataset = load_from_disk(cache_path)
+    if is_main_process:
+        print(f"Cached samples: {len(train_dataset)}")
+else:
+    train_data = build_train_data(users)
+    if is_main_process:
+        print(f"Train samples: {len(train_data)}")
+
+    if len(train_data) == 0:
+        raise ValueError("No train samples built from user records.")
+
+    if is_main_process:
+        preview_cnt = min(2, len(train_data))
+        for preview_idx in range(preview_cnt):
+            print(f"[RAG Prefix] Preview sample {preview_idx}")
+            print(f"prompt:\n{train_data[preview_idx]['prompt']}")
+            print(f"full_prompt:\n{train_data[preview_idx]['full_prompt']}")
+            print(f"query_text:\n{train_data[preview_idx]['query_text']}")
+            print(f"retrieved_texts:\n{train_data[preview_idx]['retrieved_texts']}")
+
+    _, tokenizer_for_cache, _ = create_frozen_backbone_and_tokenizer()
+    generate_and_tokenize_prompt_for_cache = create_tokenizers(tokenizer_for_cache)
+    train_dataset = Dataset.from_list(train_data)
+    train_dataset = train_dataset.map(generate_and_tokenize_prompt_for_cache, num_proc=args.map_num_proc)
+    train_dataset = train_dataset.shuffle()
+
+    if is_main_process:
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        train_dataset.save_to_disk(cache_path)
+        print(f"Saved cached dataset: {cache_path}")
+
+if args.preprocess_only:
+    if is_main_process:
+        print("Preprocess-only mode, skip training.")
+    raise SystemExit(0)
+
+frozen_model, tokenizer, task_ckpt_path = create_frozen_backbone_and_tokenizer()
+hidden_size = frozen_model.config.hidden_size
+rag_lora_config = build_rag_lora_config()
+lora_base_model = get_peft_model(frozen_model, rag_lora_config)
+model = RagPrefixModel(
+    lora_base_model,
+    hidden_size=hidden_size,
+    prefix_len=args.prefix_len,
+)
+if args.local_rank != -1:
+    model = model.to(torch.device("cuda", args.local_rank))
+
+if is_main_process:
+    print(f"Loaded frozen task base: {task_ckpt_path}")
+    print_trainable_parameters(model)
+
+trainer = transformers.Trainer(
+    model=model,
+    train_dataset=train_dataset,
+    args=training_arguments,
+    data_collator=RagPrefixCollator(
+        tokenizer,
+        rag_k=args.k,
+        query_max_len=args.query_max_len,
+        record_max_len=args.record_max_len,
+    ),
+)
+
+trainer.train()
+
+os.makedirs(f"./ckpt/{args.task_name}", exist_ok=True)
+model_short = model_name.split('/')[-1]
+suffix = "-profile" if args.add_profile else ""
+lora_output = f"./ckpt/{args.task_name}/k{args.k}-{args.task_name}-{model_short}{suffix}-rag-prefix-lora"
+prefix_output = f"./ckpt/{args.task_name}/k{args.k}-{args.task_name}-{model_short}{suffix}-rag-prefix.pt"
+
+if is_main_process:
+    model.base_model.save_pretrained(lora_output)
+    payload = {
+        "task_name": args.task_name,
+        "model_name": args.model_name,
+        "k": args.k,
+        "add_profile": args.add_profile,
+        "base_task_ckpt": task_ckpt_path,
+        "hidden_size": hidden_size,
+        "prefix_len": args.prefix_len,
+        "query_max_len": args.query_max_len,
+        "record_max_len": args.record_max_len,
+        "attn_mlp": model.attn_mlp.state_dict(),
+        "prefix_proj": model.prefix_proj.state_dict(),
+        "rag_lora_path": lora_output,
+        "rag_lora_r": args.rag_lora_r,
+        "rag_lora_alpha": args.rag_lora_alpha,
+        "rag_lora_dropout": args.rag_lora_dropout,
+    }
+    torch.save(payload, prefix_output)
+    print(f"Saved RAG-prefix LoRA: {lora_output}")
+    print(f"Saved RAG-prefix module: {prefix_output}")
+
+
+del trainer
+del model
+del frozen_model
+torch.cuda.empty_cache()
