@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+from datetime import datetime
 
 import torch
 import torch.nn as nn
@@ -40,6 +41,8 @@ def parse_args():
     parser.add_argument('--rag_lora_path', type=str, default='', help='RAG-prefix LoRA checkpoint path')
     parser.add_argument('--query_max_len', type=int, default=128)
     parser.add_argument('--record_max_len', type=int, default=128)
+    parser.add_argument('--use_time_bias', action='store_true', help='Enable recency-based bias in RAG attention')
+    parser.add_argument('--use_order_bias', action='store_true', help='Enable order-index bias in RAG attention')
     return parser.parse_args()
 
 
@@ -48,20 +51,22 @@ def resolve_task_ckpt_path(task_name, model_name):
     return f"./ckpt/{task_name}/k0-{task_name}-{model_short}-task_LoRA_ckpt"
 
 
-def resolve_rag_prefix_ckpt_path(task_name, model_name, k, profile):
+def resolve_rag_prefix_ckpt_path(task_name, model_name, k, profile, use_time_bias=False, use_order_bias=False):
     model_short = model_name.split('/')[-1]
     suffix = "-profile" if profile else ""
-    return f"./ckpt/{task_name}/k{k}-{task_name}-{model_short}{suffix}-rag-prefix.pt"
+    bias_tag = f"{'-tb' if use_time_bias else ''}{'-ob' if use_order_bias else ''}"
+    return f"./ckpt/{task_name}/k{k}-{task_name}-{model_short}{suffix}{bias_tag}-rag-prefix.pt"
 
 
-def resolve_rag_lora_path(task_name, model_name, k, profile):
+def resolve_rag_lora_path(task_name, model_name, k, profile, use_time_bias=False, use_order_bias=False):
     model_short = model_name.split('/')[-1]
     suffix = "-profile" if profile else ""
-    return f"./ckpt/{task_name}/k{k}-{task_name}-{model_short}{suffix}-rag-prefix-lora"
+    bias_tag = f"{'-tb' if use_time_bias else ''}{'-ob' if use_order_bias else ''}"
+    return f"./ckpt/{task_name}/k{k}-{task_name}-{model_short}{suffix}{bias_tag}-rag-prefix-lora"
 
 
 class RagPrefixModule(nn.Module):
-    def __init__(self, hidden_size, prefix_len):
+    def __init__(self, hidden_size, prefix_len, use_time_bias=False, use_order_bias=False):
         super().__init__()
         self.hidden_size = hidden_size
         self.prefix_len = prefix_len
@@ -71,6 +76,10 @@ class RagPrefixModule(nn.Module):
             nn.Linear(hidden_size, 1),
         )
         self.prefix_proj = nn.Linear(hidden_size, hidden_size * prefix_len)
+        self.use_time_bias = use_time_bias
+        self.use_order_bias = use_order_bias
+        self.register_buffer("time_bias_lambda", torch.tensor(0.0), persistent=False)
+        self.register_buffer("order_bias_lambda", torch.tensor(0.0), persistent=False)
 
     def _mean_pool_embeds(self, embeds, attention_mask):
         mask = attention_mask.unsqueeze(-1).to(embeds.dtype)
@@ -78,7 +87,7 @@ class RagPrefixModule(nn.Module):
         denom = mask.sum(dim=1).clamp_min(1.0)
         return summed / denom
 
-    def build_prefix(self, embedding_layer, query_input_ids, query_attention_mask, record_input_ids, record_attention_mask, record_valid_mask):
+    def build_prefix(self, embedding_layer, query_input_ids, query_attention_mask, record_input_ids, record_attention_mask, record_valid_mask, record_delta_days=None, record_order_idx=None):
         batch_size = query_input_ids.size(0)
         top_k = record_input_ids.size(1)
         rec_len = record_input_ids.size(2)
@@ -97,6 +106,17 @@ class RagPrefixModule(nn.Module):
 
         valid = record_valid_mask.to(scores.dtype)
         scores = scores.masked_fill(valid == 0, -1e4)
+
+        if self.use_time_bias and record_delta_days is not None:
+            recency_penalty = torch.log1p(record_delta_days.to(scores.dtype).clamp_min(0.0))
+            scores = scores - self.time_bias_lambda.to(scores.dtype) * recency_penalty
+            scores = scores.masked_fill(valid == 0, -1e4)
+
+        if self.use_order_bias and record_order_idx is not None:
+            order_penalty = torch.log1p(record_order_idx.to(scores.dtype).clamp_min(0.0))
+            scores = scores - self.order_bias_lambda.to(scores.dtype) * order_penalty
+            scores = scores.masked_fill(valid == 0, -1e4)
+
         attn = torch.softmax(scores, dim=-1)
         attn = attn * valid
         attn = attn / attn.sum(dim=-1, keepdim=True).clamp_min(1e-8)
@@ -106,18 +126,37 @@ class RagPrefixModule(nn.Module):
         return prefix
 
 
-def build_prefix_inputs(tokenizer, query_texts, retrieved_texts_list, rag_k, query_max_len, record_max_len, device):
+def build_prefix_inputs(tokenizer, query_texts, retrieved_texts_list, rag_k, query_max_len, record_max_len, device, delta_days_list=None, order_idx_list=None):
     batch_size = len(query_texts)
 
     record_texts_flat = []
     valid_mask = []
-    for recs in retrieved_texts_list:
+    delta_days_flat = []
+    order_idx_flat = []
+    for i, recs in enumerate(retrieved_texts_list):
         recs = recs if isinstance(recs, list) else []
         recs = [str(r) for r in recs][:rag_k]
-        recs = recs + [""] * (rag_k - len(recs))
-        for rec in recs:
+        deltas = [] if delta_days_list is None else delta_days_list[i]
+        if not isinstance(deltas, list):
+            deltas = []
+        deltas = [float(x) if x is not None else 0.0 for x in deltas][:rag_k]
+        orders = [] if order_idx_list is None else order_idx_list[i]
+        if not isinstance(orders, list):
+            orders = []
+        orders = [float(x) if x is not None else 0.0 for x in orders][:rag_k]
+
+        if len(recs) < rag_k:
+            recs = recs + [""] * (rag_k - len(recs))
+        if len(deltas) < rag_k:
+            deltas = deltas + [0.0] * (rag_k - len(deltas))
+        if len(orders) < rag_k:
+            orders = orders + [0.0] * (rag_k - len(orders))
+
+        for rec, dd, oi in zip(recs, deltas, orders):
             record_texts_flat.append(rec)
             valid_mask.append(1 if rec.strip() else 0)
+            delta_days_flat.append(float(dd))
+            order_idx_flat.append(float(oi))
 
     q_tokens = tokenizer(
         query_texts,
@@ -146,6 +185,8 @@ def build_prefix_inputs(tokenizer, query_texts, retrieved_texts_list, rag_k, que
         "record_input_ids": record_input_ids,
         "record_attention_mask": record_attention_mask,
         "record_valid_mask": record_valid_mask,
+        "record_delta_days": torch.tensor(delta_days_flat, dtype=torch.float, device=device).view(batch_size, rag_k),
+        "record_order_idx": torch.tensor(order_idx_flat, dtype=torch.float, device=device).view(batch_size, rag_k),
     }
 
 
@@ -166,8 +207,12 @@ def main():
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     task_ckpt_path = args.task_ckpt_path or resolve_task_ckpt_path(task_name, model_name)
-    rag_prefix_ckpt = args.rag_prefix_ckpt_path or resolve_rag_prefix_ckpt_path(task_name, model_name, args.k, args.profile)
-    rag_lora_path = args.rag_lora_path or resolve_rag_lora_path(task_name, model_name, args.k, args.profile)
+    rag_prefix_ckpt = args.rag_prefix_ckpt_path or resolve_rag_prefix_ckpt_path(
+        task_name, model_name, args.k, args.profile, args.use_time_bias, args.use_order_bias
+    )
+    rag_lora_path = args.rag_lora_path or resolve_rag_lora_path(
+        task_name, model_name, args.k, args.profile, args.use_time_bias, args.use_order_bias
+    )
 
     if not os.path.exists(task_ckpt_path):
         raise FileNotFoundError(f"Task LoRA checkpoint not found: {task_ckpt_path}")
@@ -208,9 +253,20 @@ def main():
     query_max_len = int(rag_payload.get("query_max_len", args.query_max_len))
     record_max_len = int(rag_payload.get("record_max_len", args.record_max_len))
 
-    rag_prefix = RagPrefixModule(hidden_size=hidden_size, prefix_len=prefix_len)
+    use_time_bias = bool(rag_payload.get("use_time_bias", False) or args.use_time_bias)
+    use_order_bias = bool(rag_payload.get("use_order_bias", False) or args.use_order_bias)
+    rag_prefix = RagPrefixModule(
+        hidden_size=hidden_size,
+        prefix_len=prefix_len,
+        use_time_bias=use_time_bias,
+        use_order_bias=use_order_bias,
+    )
     rag_prefix.attn_mlp.load_state_dict(rag_payload["attn_mlp"])
     rag_prefix.prefix_proj.load_state_dict(rag_payload["prefix_proj"])
+    if rag_payload.get("time_bias_lambda", None) is not None:
+        rag_prefix.time_bias_lambda = torch.tensor(float(rag_payload["time_bias_lambda"]))
+    if rag_payload.get("order_bias_lambda", None) is not None:
+        rag_prefix.order_bias_lambda = torch.tensor(float(rag_payload["order_bias_lambda"]))
     rag_prefix_dtype = model.get_input_embeddings().weight.dtype
     rag_prefix = rag_prefix.to(model.device, dtype=rag_prefix_dtype)
     rag_prefix.eval()
@@ -272,6 +328,8 @@ def main():
         test_prompt_list = []
         query_texts = []
         retrieved_texts_list = []
+        retrieved_delta_days_list = []
+        retrieved_order_idx_list = []
         question_id_list = []
 
         for q in test_data[i]['query']:
@@ -292,18 +350,58 @@ def main():
                 test_prompt = "##USER PROFILE:\n" + profile_text + "\n" + test_prompt
 
             retrieved_texts = []
+            retrieved_delta_days = []
+            retrieved_order_idx = []
             if args.k > 0 and bm25 is not None:
                 top_n = min(args.k, len(history_list))
                 retrieved_texts = bm25.get_top_n(retrieval_query.split(" "), history_list, n=top_n)
+                if args.use_time_bias or args.use_order_bias:
+                    text_to_delta = {}
+                    text_to_order = {}
+                    query_date = q.get("date", None)
+                    query_ord = None
+                    if isinstance(query_date, str) and query_date.strip():
+                        for fmt in ["%Y-%m-%d", "%Y/%m/%d", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m", "%Y/%m"]:
+                            try:
+                                query_ord = datetime.strptime(query_date.strip(), fmt).toordinal()
+                                break
+                            except Exception:
+                                pass
+                    for rec_idx, rec in enumerate(test_data[i]['profile']):
+                        rec_text = prompt_template[args.task_name]['retrieval_history'].format(**rec)
+                        if args.use_time_bias:
+                            rec_ord = None
+                            rec_date = rec.get("date", None)
+                            if isinstance(rec_date, str) and rec_date.strip():
+                                for fmt in ["%Y-%m-%d", "%Y/%m/%d", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m", "%Y/%m"]:
+                                    try:
+                                        rec_ord = datetime.strptime(rec_date.strip(), fmt).toordinal()
+                                        break
+                                    except Exception:
+                                        pass
+                            if query_ord is not None and rec_ord is not None:
+                                text_to_delta[rec_text] = float(max(0, query_ord - rec_ord))
+                            else:
+                                text_to_delta[rec_text] = 0.0
+                        if args.use_order_bias:
+                            text_to_order[rec_text] = float(rec_idx + 1)
+                    if args.use_time_bias:
+                        retrieved_delta_days = [text_to_delta.get(t, 0.0) for t in retrieved_texts]
+                    if args.use_order_bias:
+                        retrieved_order_idx = [text_to_order.get(t, 0.0) for t in retrieved_texts]
 
             test_prompt_list.append(test_prompt)
             query_texts.append(retrieval_query)
             retrieved_texts_list.append(retrieved_texts)
+            retrieved_delta_days_list.append(retrieved_delta_days)
+            retrieved_order_idx_list.append(retrieved_order_idx)
             question_id_list.append(q['id'])
 
         prompt_batch_list = split_batch(test_prompt_list, args.batch_size)
         query_batch_list = split_batch(query_texts, args.batch_size)
         retrieved_batch_list = split_batch(retrieved_texts_list, args.batch_size)
+        retrieved_delta_batch_list = split_batch(retrieved_delta_days_list, args.batch_size)
+        retrieved_order_batch_list = split_batch(retrieved_order_idx_list, args.batch_size)
 
         out_list = []
         with torch.inference_mode():
@@ -311,6 +409,8 @@ def main():
                 prompt_batch = prompt_batch_list[batch_idx]
                 query_batch = query_batch_list[batch_idx]
                 retrieved_batch = retrieved_batch_list[batch_idx]
+                delta_batch = retrieved_delta_batch_list[batch_idx]
+                order_batch = retrieved_order_batch_list[batch_idx]
 
                 inputs = tokenizer(prompt_batch, return_tensors="pt", padding=True, return_token_type_ids=False)
                 inputs = {k: v.to(model.device) for k, v in inputs.items()}
@@ -323,6 +423,8 @@ def main():
                     query_max_len=query_max_len,
                     record_max_len=record_max_len,
                     device=model.device,
+                    delta_days_list=delta_batch,
+                    order_idx_list=order_batch,
                 )
 
                 prefix_embeds = rag_prefix.build_prefix(

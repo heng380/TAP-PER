@@ -43,6 +43,7 @@ def parse_args():
     parser.add_argument('--record_max_len', type=int, default=128)
     parser.add_argument('--use_time_bias', action='store_true', help='Enable recency-based bias in RAG attention')
     parser.add_argument('--use_order_bias', action='store_true', help='Enable order-index bias in RAG attention')
+    parser.add_argument('--disable_pag', action='store_true', help='Disable PAG branch and evaluate with RAG prefix only')
     return parser.parse_args()
 
 
@@ -51,17 +52,17 @@ def resolve_task_ckpt_path(task_name, model_name):
     return f"./ckpt/{task_name}/k0-{task_name}-{model_short}-task_LoRA_ckpt"
 
 
-def resolve_ragpag_prefix_ckpt_path(task_name, model_name, k, profile, use_time_bias=False, use_order_bias=False):
+def resolve_ragpag_prefix_ckpt_path(task_name, model_name, k, profile, use_time_bias=False, use_order_bias=False, disable_pag=False):
     model_short = model_name.split('/')[-1]
     suffix = "-profile" if profile else ""
-    bias_tag = f"{'-tb' if use_time_bias else ''}{'-ob' if use_order_bias else ''}"
+    bias_tag = f"{'-tb' if use_time_bias else ''}{'-ob' if use_order_bias else ''}{'-nopag' if disable_pag else ''}"
     return f"./ckpt/{task_name}/k{k}-{task_name}-{model_short}{suffix}{bias_tag}-ragpag-prefix.pt"
 
 
-def resolve_ragpag_lora_path(task_name, model_name, k, profile, use_time_bias=False, use_order_bias=False):
+def resolve_ragpag_lora_path(task_name, model_name, k, profile, use_time_bias=False, use_order_bias=False, disable_pag=False):
     model_short = model_name.split('/')[-1]
     suffix = "-profile" if profile else ""
-    bias_tag = f"{'-tb' if use_time_bias else ''}{'-ob' if use_order_bias else ''}"
+    bias_tag = f"{'-tb' if use_time_bias else ''}{'-ob' if use_order_bias else ''}{'-nopag' if disable_pag else ''}"
     return f"./ckpt/{task_name}/k{k}-{task_name}-{model_short}{suffix}{bias_tag}-ragpag-lora"
 
 
@@ -259,10 +260,10 @@ def main():
 
     task_ckpt_path = args.task_ckpt_path or resolve_task_ckpt_path(task_name, model_name)
     ragpag_prefix_ckpt = args.ragpag_prefix_ckpt_path or resolve_ragpag_prefix_ckpt_path(
-        task_name, model_name, args.k, args.profile, args.use_time_bias, args.use_order_bias
+        task_name, model_name, args.k, args.profile, args.use_time_bias, args.use_order_bias, args.disable_pag
     )
     ragpag_lora_path = args.ragpag_lora_path or resolve_ragpag_lora_path(
-        task_name, model_name, args.k, args.profile, args.use_time_bias, args.use_order_bias
+        task_name, model_name, args.k, args.profile, args.use_time_bias, args.use_order_bias, args.disable_pag
     )
 
     if not os.path.exists(task_ckpt_path):
@@ -301,6 +302,7 @@ def main():
     ragpag_payload = torch.load(ragpag_prefix_ckpt, map_location='cpu')
 
     user_id_to_index = {int(k): int(v) for k, v in ragpag_payload.get("user_id_to_index", {}).items()}
+    disable_pag = bool(ragpag_payload.get("disable_pag", False) or args.disable_pag)
     prefix_len = int(ragpag_payload.get("prefix_len", 8))
     hidden_size = int(ragpag_payload.get("hidden_size", model.config.hidden_size))
     query_max_len = int(ragpag_payload.get("query_max_len", args.query_max_len))
@@ -310,11 +312,13 @@ def main():
     time_bias_lambda = ragpag_payload.get("time_bias_lambda", None)
     order_bias_lambda = ragpag_payload.get("order_bias_lambda", None)
 
-    pag_embedding = nn.Embedding(len(user_id_to_index), hidden_size * prefix_len)
-    pag_embedding.load_state_dict(ragpag_payload["pag_user_embedding"])
     pag_dtype = model.get_input_embeddings().weight.dtype
-    pag_embedding = pag_embedding.to(model.device, dtype=pag_dtype)
-    pag_embedding.eval()
+    pag_embedding = None
+    if not disable_pag:
+        pag_embedding = nn.Embedding(len(user_id_to_index), hidden_size * prefix_len)
+        pag_embedding.load_state_dict(ragpag_payload["pag_user_embedding"])
+        pag_embedding = pag_embedding.to(model.device, dtype=pag_dtype)
+        pag_embedding.eval()
 
     rag_prefix = RagPrefixModule(hidden_size=hidden_size, prefix_len=prefix_len)
     rag_prefix.attn_mlp.load_state_dict(ragpag_payload["attn_mlp"])
@@ -322,6 +326,7 @@ def main():
     rag_prefix = rag_prefix.to(model.device, dtype=pag_dtype)
     rag_prefix.eval()
 
+    print(f"Disable PAG branch: {disable_pag}")
     print(f"Use time bias: {use_time_bias}, lambda={time_bias_lambda}")
     print(f"Use order bias: {use_order_bias}, lambda={order_bias_lambda}")
 
@@ -479,20 +484,24 @@ def main():
                     **rag_inputs,
                 )
 
-                user_ids = torch.tensor([user_id] * len(prompt_batch), dtype=torch.long, device=model.device)
-                pag_prefix_embeds = build_pag_prefix_from_user_ids(
-                    user_ids=user_ids,
-                    user_id_to_index=user_id_to_index,
-                    pag_embedding_layer=pag_embedding,
-                    prefix_len=prefix_len,
-                    hidden_size=hidden_size,
-                    device=model.device,
-                    dtype=rag_prefix_embeds.dtype,
-                )
-
                 token_embeds = model.get_input_embeddings()(inputs["input_ids"])
                 rag_prefix_embeds = rag_prefix_embeds.to(token_embeds.dtype)
-                combined_prefix = (pag_prefix_embeds + rag_prefix_embeds).to(token_embeds.dtype)
+
+                if disable_pag:
+                    combined_prefix = rag_prefix_embeds
+                else:
+                    user_ids = torch.tensor([user_id] * len(prompt_batch), dtype=torch.long, device=model.device)
+                    pag_prefix_embeds = build_pag_prefix_from_user_ids(
+                        user_ids=user_ids,
+                        user_id_to_index=user_id_to_index,
+                        pag_embedding_layer=pag_embedding,
+                        prefix_len=prefix_len,
+                        hidden_size=hidden_size,
+                        device=model.device,
+                        dtype=rag_prefix_embeds.dtype,
+                    )
+                    combined_prefix = (pag_prefix_embeds + rag_prefix_embeds).to(token_embeds.dtype)
+
                 inputs_embeds = torch.cat([combined_prefix, token_embeds], dim=1)
 
                 prefix_mask = torch.ones(
@@ -529,7 +538,7 @@ def main():
             prompt_output_records.append({
                 "id": question_id,
                 "user_id": user_id,
-                "prompt": "[ragpag_prefix=pag+rag(joint-trained)]\n" + test_prompt_list[j],
+                "prompt": ("[ragpag_prefix=rag_only(no_pag)]\n" if disable_pag else "[ragpag_prefix=pag+rag(joint-trained)]\n") + test_prompt_list[j],
                 "output": output,
                 "gold": golds_dict.get(question_id, ""),
             })

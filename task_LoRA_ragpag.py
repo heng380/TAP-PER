@@ -35,6 +35,7 @@ parser.add_argument('--query_max_len', type=int, default=128)
 parser.add_argument('--record_max_len', type=int, default=128)
 parser.add_argument('--use_time_bias', action='store_true', help='Enable recency-based bias in RAG attention')
 parser.add_argument('--use_order_bias', action='store_true', help='Enable order-index bias in RAG attention')
+parser.add_argument('--disable_pag', action='store_true', help='Disable PAG branch and train RAG+mediator only')
 parser.add_argument('--preprocess_only', action='store_true')
 parser.add_argument('--cache_dir', type=str, default='./cache_rp')
 parser.add_argument('--map_num_proc', type=int, default=8)
@@ -43,8 +44,32 @@ args = parser.parse_args()
 TASK_TRAIN_OVERRIDES = {
     "movie_tagging": {
         "batch_size": 1,
+        "learning_rate": 1e-4,
+    },
+    "citation": {
+        "batch_size": 4,
         "learning_rate": 2e-4,
     },
+    "news_categorize": {
+        "batch_size": 2,
+        "learning_rate": 1e-4,
+    },
+    "product_rating": {
+        "batch_size": 4,
+        "learning_rate": 2e-4,
+    },
+    "news_headline": {
+        "batch_size": 4,
+        "learning_rate": 2e-4,
+    },
+    "scholarly_title": {
+        "batch_size": 2,
+        "learning_rate": 1e-4,
+    },
+    "tweet_paraphrase": {
+        "batch_size": 4,
+        "learning_rate": 1e-5,
+    }
 }
 
 if args.task_name in TASK_TRAIN_OVERRIDES:
@@ -358,15 +383,19 @@ class RagPrefixModule(nn.Module):
 
 
 class RagPagPrefixModel(nn.Module):
-    def __init__(self, base_model, hidden_size, prefix_len, num_users, user_id_to_index, use_time_bias=False, use_order_bias=False):
+    def __init__(self, base_model, hidden_size, prefix_len, num_users, user_id_to_index, use_time_bias=False, use_order_bias=False, disable_pag=False):
         super().__init__()
         self.base_model = base_model
         self.prefix_len = prefix_len
         self.hidden_size = hidden_size
 
-        self.pag_user_embedding = nn.Embedding(num_users, hidden_size * prefix_len)
-        nn.init.normal_(self.pag_user_embedding.weight, mean=0.0, std=0.02)
+        self.disable_pag = bool(disable_pag)
         self.user_id_to_index = {int(k): int(v) for k, v in user_id_to_index.items()}
+        if not self.disable_pag:
+            self.pag_user_embedding = nn.Embedding(num_users, hidden_size * prefix_len)
+            nn.init.normal_(self.pag_user_embedding.weight, mean=0.0, std=0.02)
+        else:
+            self.pag_user_embedding = None
 
         self.rag_prefix_module = RagPrefixModule(
             hidden_size=hidden_size,
@@ -464,7 +493,7 @@ class RagPagPrefixModel(nn.Module):
 
         token_embeds = self.base_model.get_input_embeddings()(input_ids)
 
-        if user_id is None:
+        if self.disable_pag or user_id is None:
             pag_prefix = torch.zeros(
                 token_embeds.size(0),
                 self.prefix_len,
@@ -652,7 +681,7 @@ users = train
 if is_main_process:
     print(f"Loaded train users (top100): {len(users)}")
 
-cache_tag = f"k{args.k}{'-profile' if args.add_profile else ''}{'-tb' if args.use_time_bias else ''}{'-ob' if args.use_order_bias else ''}"
+cache_tag = f"k{args.k}{'-profile' if args.add_profile else ''}{'-tb' if args.use_time_bias else ''}{'-ob' if args.use_order_bias else ''}{'-nopag' if args.disable_pag else ''}"
 cache_path = os.path.join(
     args.cache_dir,
     args.task_name,
@@ -716,6 +745,7 @@ def build_ragpag_lora_config():
 if is_main_process:
     print(f"Loaded frozen task LoRA: {task_ckpt_path}")
     print("Initialize RAG DIN module + PAG user embedding + mediator LoRA from scratch")
+    print(f"Disable PAG branch: {args.disable_pag}")
     print(f"Time bias enabled: {args.use_time_bias}")
     print(f"Order bias enabled: {args.use_order_bias}")
 
@@ -736,6 +766,7 @@ model = RagPagPrefixModel(
     user_id_to_index=user_id_to_index,
     use_time_bias=args.use_time_bias,
     use_order_bias=args.use_order_bias,
+    disable_pag=args.disable_pag,
 )
 
 if args.local_rank != -1:
@@ -761,7 +792,7 @@ trainer.train()
 os.makedirs(f"./ckpt/{args.task_name}", exist_ok=True)
 model_short = model_name.split('/')[-1]
 suffix = "-profile" if args.add_profile else ""
-bias_tag = f"{'-tb' if args.use_time_bias else ''}{'-ob' if args.use_order_bias else ''}"
+bias_tag = f"{'-tb' if args.use_time_bias else ''}{'-ob' if args.use_order_bias else ''}{'-nopag' if args.disable_pag else ''}"
 ragpag_lora_output = f"./ckpt/{args.task_name}/k{args.k}-{args.task_name}-{model_short}{suffix}{bias_tag}-ragpag-lora"
 ragpag_prefix_output = f"./ckpt/{args.task_name}/k{args.k}-{args.task_name}-{model_short}{suffix}{bias_tag}-ragpag-prefix.pt"
 
@@ -778,7 +809,8 @@ if is_main_process:
         "query_max_len": args.query_max_len,
         "record_max_len": args.record_max_len,
         "user_id_to_index": user_id_to_index,
-        "pag_user_embedding": {k: v.detach().cpu() for k, v in model.pag_user_embedding.state_dict().items()},
+        "disable_pag": args.disable_pag,
+        "pag_user_embedding": ({k: v.detach().cpu() for k, v in model.pag_user_embedding.state_dict().items()} if model.pag_user_embedding is not None else None),
         "attn_mlp": {k: v.detach().cpu() for k, v in model.rag_prefix_module.attn_mlp.state_dict().items()},
         "prefix_proj": {k: v.detach().cpu() for k, v in model.rag_prefix_module.prefix_proj.state_dict().items()},
         "ragpag_lora_path": ragpag_lora_output,

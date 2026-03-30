@@ -15,11 +15,11 @@ from peft import LoraConfig, get_peft_model, PeftModel
 
 parser = argparse.ArgumentParser(description="Parser for LoRA")
 parser.add_argument('--model_name', type=str, default='/cfs/models/llama/llama3.1-8B')
-parser.add_argument('--batch_size', type=int, default=16)
+parser.add_argument('--batch_size', type=int, default=8)
 parser.add_argument('--k', type=int, default=0)
 parser.add_argument('--max_step', type=int, default=5000)
 parser.add_argument('--cut_off', type=int, default=2048)
-parser.add_argument('--max_epoch', type=int, default=2)
+parser.add_argument('--max_epoch', type=int, default=3)
 parser.add_argument('--temperature', type=float, default=0.1)
 parser.add_argument('--task_name', type=str, default='movie_tagging')
 parser.add_argument('--add_profile', action='store_true')
@@ -97,7 +97,7 @@ base_model = prepare_model_for_kbit_training(base_model)
 from peft import LoraConfig, get_peft_model 
 
 peft_config = LoraConfig(
-    r=8,
+    r=4,
     lora_alpha=8,
     target_modules=["q_proj", "v_proj"], # , "k_proj", "out_proj"
     lora_dropout=0.05,
@@ -111,9 +111,9 @@ training_arguments = transformers.TrainingArguments(
     gradient_accumulation_steps=1,
     optim='adamw_torch',
     num_train_epochs=max_epoch,
-    save_steps=1e9,
+    save_strategy='no',
     logging_steps=50,
-    learning_rate=1e-4,
+    learning_rate=1e-5,
     weight_decay=1e-2,
     bf16=True,
     max_grad_norm=0.3,
@@ -128,7 +128,7 @@ training_arguments = transformers.TrainingArguments(
 with open(f"./data/{task_name}/user_top_100_history.json", 'r') as f:
     test_data = json.load(f)
 
-format_flag = False
+format_flag = True
 if args.task_name == "movie_tagging":
     extract_article = extract_movie
     format_flag = True
@@ -139,13 +139,14 @@ elif args.task_name == "news_headline":
     extract_article = extract_news_headline
     format_flag = True
 elif args.task_name == "product_rating":
-    extract_article = extrat_product_review
+    extract_article = extract_product_review
     format_flag = True
 elif args.task_name == "scholarly_title":
     extract_article = extract_scholarly_title
     format_flag = True
 elif args.task_name == "tweet_paraphrase":
-    extract_article = extrat_tweet_paraphrasing
+    extract_article = extract_tweet_paraphrasing
+    format_flag = True
 
 
 with open('./prompt/prompt.json', 'r') as f:
@@ -225,17 +226,21 @@ for i in tqdm(range(len(test_data))):
 
     for idx, q in enumerate(test_data[i]['profile']):
         for key, value in q.items():
-            q[key] = get_first_k_tokens(q[key], 768)
+            if isinstance(value, str):
+                q[key] = get_first_k_tokens(value, 768)
             
         prompt = prompt_template[args.task_name]['OPPU_input'].format(**q)
         full_prompt = prompt_template[args.task_name]['OPPU_full'].format(**q)
+        prompt = "##INSTRUCTION:\n" + prompt
+        full_prompt = "##INSTRUCTION:\n" + full_prompt
 
-        if k > 0 and idx != 0 and format_flag==True:
+        if k > 0 and idx != 0:
             visible_history_list = test_data[i]['profile'][:idx]
 
             for p in visible_history_list:
                 for key, value in p.items():
-                    p[key] = get_first_k_tokens(p[key], 768)
+                    if isinstance(value, str):
+                        p[key] = get_first_k_tokens(value, 768)
 
             history_list = [prompt_template[args.task_name]['retrieval_history'].format(**p) for p in visible_history_list]
             tokenized_corpus = [doc.split(" ") for doc in history_list]
@@ -245,12 +250,12 @@ for i in tqdm(range(len(test_data))):
             retrieved_history = bm25.get_top_n(tokenized_query, history_list, n=args.k)
 
             history_string = "".join(retrieved_history)
-            prompt = history_string + "\n" + prompt
-            full_prompt = history_string + "\n" + full_prompt
+            prompt = "##USER HISTORY:\n" + history_string + "\n" + prompt
+            full_prompt = "##USER HISTORY:\n" + history_string + "\n" + full_prompt
 
-        if args.add_profile and format_flag == True:
-            prompt = profile + "\n" + prompt
-            full_prompt = profile + "\n" + full_prompt
+        if args.add_profile:
+            prompt = "##USER PROFILE:\n" + profile + "\n" + prompt
+            full_prompt = "##USER PROFILE:\n" + profile + "\n" + full_prompt
 
         train_data.append(
             {
@@ -259,7 +264,11 @@ for i in tqdm(range(len(test_data))):
             }
         )
 
-    # print(train_data)
+    if len(train_data) > 0 and i == 0:
+        preview_cnt = min(2, len(train_data))
+        for preview_idx in range(preview_cnt):
+            print(f"[DEBUG][train sample {preview_idx}] input:\n{train_data[preview_idx]['prompt']}")
+            print(f"[DEBUG][train sample {preview_idx}] target:\n{train_data[preview_idx]['full_prompt']}")
 
     train_dataset = Dataset.from_list(train_data)
     train_dataset = train_dataset.map(generate_and_tokenize_prompt).shuffle()
@@ -295,7 +304,8 @@ for i in tqdm(range(len(test_data))):
         visible_history_list = test_data[i]['profile']
         for p in visible_history_list:
             for key, value in p.items():
-                p[key] = get_first_k_tokens(p[key], 368)
+                if isinstance(value, str):
+                    p[key] = get_first_k_tokens(value, 368)
 
         history_list = [prompt_template[args.task_name]['retrieval_history'].format(**p) for p in visible_history_list]
 
@@ -312,21 +322,22 @@ for i in tqdm(range(len(test_data))):
             test_article = extract_citation_title(test_question)
             option1, option2 = extract_option(test_question, 1), extract_option(test_question, 2)
             test_prompt = prompt_template[args.task_name]['prompt'].format(test_article, option1, option2)
-
         else:
             test_question = q['input']
             test_article = extract_article(test_question)
             test_prompt =  prompt_template[args.task_name]['prompt'].format(test_article)
 
+        test_prompt = "##INSTRUCTION:\n" + test_prompt
+
         if k > 0:
             tokenized_query = prompt_template[args.task_name]['retrieval_query_wokey'].format(test_article).split(" ")
             retrieved_history = bm25.get_top_n(tokenized_query, history_list, n=args.k)
-        
+
             history_string = "".join(retrieved_history)
-            test_prompt = history_string + "\n" + test_prompt
+            test_prompt = "##USER HISTORY:\n" + history_string + "\n" + test_prompt
 
         if args.add_profile:
-            test_prompt = profile + "\n" + test_prompt
+            test_prompt = "##USER PROFILE:\n" + profile + "\n" + test_prompt
 
         test_question_list.append(test_prompt)
         question_id_list.append(q['id'])

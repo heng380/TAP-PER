@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+from datetime import datetime
 from string import Formatter
 
 import torch
@@ -32,10 +33,47 @@ parser.add_argument('--rag_lora_alpha', type=int, default=8)
 parser.add_argument('--rag_lora_dropout', type=float, default=0.05)
 parser.add_argument('--query_max_len', type=int, default=128)
 parser.add_argument('--record_max_len', type=int, default=128)
+parser.add_argument('--use_time_bias', action='store_true', help='Enable recency-based bias in RAG attention')
+parser.add_argument('--use_order_bias', action='store_true', help='Enable order-index bias in RAG attention')
 parser.add_argument('--preprocess_only', action='store_true')
 parser.add_argument('--cache_dir', type=str, default='./cache_rag')
 parser.add_argument('--map_num_proc', type=int, default=8)
 args = parser.parse_args()
+
+TASK_TRAIN_OVERRIDES = {
+    "movie_tagging": {
+        "batch_size": 1,
+        "learning_rate": 1e-4,
+    },
+    "citation": {
+        "batch_size": 4,
+        "learning_rate": 2e-4,
+    },
+    "news_categorize": {
+        "batch_size": 2,
+        "learning_rate": 1e-4,
+    },
+    "product_rating": {
+        "batch_size": 4,
+        "learning_rate": 2e-4,
+    },
+    "news_headline": {
+        "batch_size": 4,
+        "learning_rate": 2e-4,
+    },
+    "scholarly_title": {
+        "batch_size": 2,
+        "learning_rate": 1e-4,
+    },
+    "tweet_paraphrase": {
+        "batch_size": 4,
+        "learning_rate": 1e-5,
+    }
+}
+
+if args.task_name in TASK_TRAIN_OVERRIDES:
+    override_cfg = TASK_TRAIN_OVERRIDES[args.task_name]
+    args.batch_size = override_cfg.get("batch_size", args.batch_size)
 
 if args.local_rank == -1 and "LOCAL_RANK" in os.environ:
     args.local_rank = int(os.environ["LOCAL_RANK"])
@@ -90,6 +128,20 @@ def format_with_required_fields(template_str, values):
     return template_str.format(**format_values)
 
 
+def parse_date_to_ordinal(value):
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if not s:
+        return None
+    for fmt in ["%Y-%m-%d", "%Y/%m/%d", "%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m", "%Y/%m"]:
+        try:
+            return datetime.strptime(s, fmt).toordinal()
+        except Exception:
+            pass
+    return None
+
+
 def build_prompt_pair(idx, profile_item, user_history, profile_text):
     q = safe_truncate_dict(profile_item, limit=768)
 
@@ -106,6 +158,8 @@ def build_prompt_pair(idx, profile_item, user_history, profile_text):
         query_text = prompt
 
     retrieved_texts = []
+    retrieved_delta_days = []
+    retrieved_order_idx = []
     if k > 0 and idx != 0 and format_flag:
         visible_history_list = [safe_truncate_dict(h, limit=768) for h in user_history[:idx]]
         history_list = [prompt_template[args.task_name]['retrieval_history'].format(**p) for p in visible_history_list]
@@ -117,11 +171,31 @@ def build_prompt_pair(idx, profile_item, user_history, profile_text):
             top_n = min(args.k, len(history_list))
             retrieved_texts = bm25.get_top_n(tokenized_query, history_list, n=top_n)
 
+            if args.use_time_bias or args.use_order_bias:
+                text_to_delta = {}
+                text_to_order = {}
+                query_date_ord = parse_date_to_ordinal(profile_item.get("date", None))
+                for rec_idx, rec in enumerate(visible_history_list):
+                    rec_text = prompt_template[args.task_name]['retrieval_history'].format(**rec)
+                    if args.use_time_bias:
+                        rec_date_ord = parse_date_to_ordinal(rec.get("date", None))
+                        if query_date_ord is not None and rec_date_ord is not None:
+                            text_to_delta[rec_text] = float(max(0, query_date_ord - rec_date_ord))
+                        else:
+                            text_to_delta[rec_text] = 0.0
+                    if args.use_order_bias:
+                        text_to_order[rec_text] = float(rec_idx + 1)
+
+                if args.use_time_bias:
+                    retrieved_delta_days = [text_to_delta.get(t, 0.0) for t in retrieved_texts]
+                if args.use_order_bias:
+                    retrieved_order_idx = [text_to_order.get(t, 0.0) for t in retrieved_texts]
+
     if args.add_profile and format_flag:
         prompt = profile_text + "\n" + prompt
         full_prompt = profile_text + "\n" + full_prompt
 
-    return prompt, full_prompt, query_text, retrieved_texts
+    return prompt, full_prompt, query_text, retrieved_texts, retrieved_delta_days, retrieved_order_idx
 
 
 def build_train_data(users):
@@ -131,7 +205,7 @@ def build_train_data(users):
         profile_text = profile_by_user_id.get(uid, "") if args.add_profile else ""
 
         for idx, profile_item in enumerate(sample['profile']):
-            prompt, full_prompt, query_text, retrieved_texts = build_prompt_pair(
+            prompt, full_prompt, query_text, retrieved_texts, retrieved_delta_days, retrieved_order_idx = build_prompt_pair(
                 idx, profile_item, sample['profile'], profile_text
             )
             train_data.append({
@@ -139,6 +213,8 @@ def build_train_data(users):
                 "full_prompt": full_prompt,
                 "query_text": query_text,
                 "retrieved_texts": retrieved_texts,
+                "retrieved_delta_days": retrieved_delta_days,
+                "retrieved_order_idx": retrieved_order_idx,
             })
     return train_data
 
@@ -180,6 +256,8 @@ def create_tokenizers(tokenizer):
 
         tokenized_full_prompt["query_text"] = data_point["query_text"]
         tokenized_full_prompt["retrieved_texts"] = data_point["retrieved_texts"]
+        tokenized_full_prompt["retrieved_delta_days"] = data_point.get("retrieved_delta_days", [])
+        tokenized_full_prompt["retrieved_order_idx"] = data_point.get("retrieved_order_idx", [])
         return tokenized_full_prompt
 
     return generate_and_tokenize_prompt
@@ -240,6 +318,20 @@ class RagPrefixModel(nn.Module):
         )
         self.prefix_proj = nn.Linear(hidden_size, hidden_size * prefix_len)
 
+        self.use_time_bias = args.use_time_bias
+        if self.use_time_bias:
+            self.time_bias_lambda = nn.Parameter(torch.empty(1))
+            nn.init.normal_(self.time_bias_lambda, mean=0.0, std=0.02)
+        else:
+            self.register_parameter('time_bias_lambda', None)
+
+        self.use_order_bias = args.use_order_bias
+        if self.use_order_bias:
+            self.order_bias_lambda = nn.Parameter(torch.empty(1))
+            nn.init.normal_(self.order_bias_lambda, mean=0.0, std=0.02)
+        else:
+            self.register_parameter('order_bias_lambda', None)
+
     def _mean_pool_embeds(self, input_ids, attention_mask):
         embeds = self.base_model.get_input_embeddings()(input_ids)
         mask = attention_mask.unsqueeze(-1).to(embeds.dtype)
@@ -254,6 +346,8 @@ class RagPrefixModel(nn.Module):
         record_input_ids,
         record_attention_mask,
         record_valid_mask,
+        record_delta_days=None,
+        record_order_idx=None,
     ):
         batch_size = query_input_ids.size(0)
         top_k = record_input_ids.size(1)
@@ -271,6 +365,16 @@ class RagPrefixModel(nn.Module):
 
         valid = record_valid_mask.to(scores.dtype)
         scores = scores.masked_fill(valid == 0, -1e4)
+
+        if self.use_time_bias and record_delta_days is not None and self.time_bias_lambda is not None:
+            recency_penalty = torch.log1p(record_delta_days.to(scores.dtype).clamp_min(0.0))
+            scores = scores - self.time_bias_lambda.to(scores.dtype) * recency_penalty
+            scores = scores.masked_fill(valid == 0, -1e4)
+
+        if self.use_order_bias and record_order_idx is not None and self.order_bias_lambda is not None:
+            order_penalty = torch.log1p(record_order_idx.to(scores.dtype).clamp_min(0.0))
+            scores = scores - self.order_bias_lambda.to(scores.dtype) * order_penalty
+            scores = scores.masked_fill(valid == 0, -1e4)
         attn = torch.softmax(scores, dim=-1)
         attn = attn * valid
         attn = attn / attn.sum(dim=-1, keepdim=True).clamp_min(1e-8)
@@ -289,6 +393,8 @@ class RagPrefixModel(nn.Module):
         record_input_ids=None,
         record_attention_mask=None,
         record_valid_mask=None,
+        record_delta_days=None,
+        record_order_idx=None,
         **kwargs,
     ):
         if input_ids is None:
@@ -317,6 +423,8 @@ class RagPrefixModel(nn.Module):
                 record_input_ids=record_input_ids,
                 record_attention_mask=record_attention_mask,
                 record_valid_mask=record_valid_mask,
+                record_delta_days=record_delta_days,
+                record_order_idx=record_order_idx,
             )
 
         inputs_embeds = torch.cat([prefix_embeds, token_embeds], dim=1)
@@ -362,22 +470,42 @@ class RagPrefixCollator:
 
         record_texts_flat = []
         valid_mask = []
+        delta_days_flat = []
+        order_idx_flat = []
         for f in features:
             recs = f.get("retrieved_texts", [])
             if not isinstance(recs, list):
                 recs = []
             recs = [str(r) for r in recs][: self.rag_k]
-            recs = recs + [""] * (self.rag_k - len(recs))
+            deltas = f.get("retrieved_delta_days", [])
+            if not isinstance(deltas, list):
+                deltas = []
+            deltas = [float(x) if x is not None else 0.0 for x in deltas][: self.rag_k]
+            orders = f.get("retrieved_order_idx", [])
+            if not isinstance(orders, list):
+                orders = []
+            orders = [float(x) if x is not None else 0.0 for x in orders][: self.rag_k]
 
-            for rec in recs:
+            if len(recs) < self.rag_k:
+                recs = recs + [""] * (self.rag_k - len(recs))
+            if len(deltas) < self.rag_k:
+                deltas = deltas + [0.0] * (self.rag_k - len(deltas))
+            if len(orders) < self.rag_k:
+                orders = orders + [0.0] * (self.rag_k - len(orders))
+
+            for rec, dd, oi in zip(recs, deltas, orders):
                 record_texts_flat.append(rec)
                 valid_mask.append(1 if rec.strip() else 0)
+                delta_days_flat.append(float(dd))
+                order_idx_flat.append(float(oi))
 
         stripped = []
         for f in features:
             item = dict(f)
             item.pop("query_text", None)
             item.pop("retrieved_texts", None)
+            item.pop("retrieved_delta_days", None)
+            item.pop("retrieved_order_idx", None)
             stripped.append(item)
 
         batch = self.inner_collator(stripped)
@@ -404,6 +532,8 @@ class RagPrefixCollator:
         batch["record_input_ids"] = rec_tokens["input_ids"].view(batch_size, self.rag_k, -1)
         batch["record_attention_mask"] = rec_tokens["attention_mask"].view(batch_size, self.rag_k, -1)
         batch["record_valid_mask"] = torch.tensor(valid_mask, dtype=torch.long).view(batch_size, self.rag_k)
+        batch["record_delta_days"] = torch.tensor(delta_days_flat, dtype=torch.float).view(batch_size, self.rag_k)
+        batch["record_order_idx"] = torch.tensor(order_idx_flat, dtype=torch.float).view(batch_size, self.rag_k)
         return batch
 
 
@@ -429,6 +559,8 @@ def build_rag_lora_config():
     )
 
 
+effective_lr = TASK_TRAIN_OVERRIDES.get(args.task_name, {}).get("learning_rate", 1e-5)
+
 training_arguments = transformers.TrainingArguments(
     output_dir='./ckpt/trainer_tmp_rag/',
     per_device_train_batch_size=batch_size,
@@ -437,7 +569,7 @@ training_arguments = transformers.TrainingArguments(
     num_train_epochs=max_epoch,
     save_steps=1e9,
     logging_steps=10,
-    learning_rate=1e-5,
+    learning_rate=effective_lr,
     weight_decay=1e-2,
     bf16=True,
     max_grad_norm=0.3,
@@ -457,7 +589,7 @@ if is_main_process:
 cache_path = os.path.join(
     args.cache_dir,
     args.task_name,
-    f"k{args.k}{'-profile' if args.add_profile else ''}",
+    f"k{args.k}{'-profile' if args.add_profile else ''}{'-tb' if args.use_time_bias else ''}{'-ob' if args.use_order_bias else ''}",
 )
 
 train_dataset = None
@@ -514,6 +646,8 @@ if args.local_rank != -1:
 
 if is_main_process:
     print(f"Loaded frozen task base: {task_ckpt_path}")
+    print(f"Time bias enabled: {args.use_time_bias}")
+    print(f"Order bias enabled: {args.use_order_bias}")
     print_trainable_parameters(model)
 
 trainer = transformers.Trainer(
@@ -533,8 +667,9 @@ trainer.train()
 os.makedirs(f"./ckpt/{args.task_name}", exist_ok=True)
 model_short = model_name.split('/')[-1]
 suffix = "-profile" if args.add_profile else ""
-lora_output = f"./ckpt/{args.task_name}/k{args.k}-{args.task_name}-{model_short}{suffix}-rag-prefix-lora"
-prefix_output = f"./ckpt/{args.task_name}/k{args.k}-{args.task_name}-{model_short}{suffix}-rag-prefix.pt"
+bias_tag = f"{'-tb' if args.use_time_bias else ''}{'-ob' if args.use_order_bias else ''}"
+lora_output = f"./ckpt/{args.task_name}/k{args.k}-{args.task_name}-{model_short}{suffix}{bias_tag}-rag-prefix-lora"
+prefix_output = f"./ckpt/{args.task_name}/k{args.k}-{args.task_name}-{model_short}{suffix}{bias_tag}-rag-prefix.pt"
 
 if is_main_process:
     model.base_model.save_pretrained(lora_output)
@@ -554,6 +689,10 @@ if is_main_process:
         "rag_lora_r": args.rag_lora_r,
         "rag_lora_alpha": args.rag_lora_alpha,
         "rag_lora_dropout": args.rag_lora_dropout,
+        "use_time_bias": args.use_time_bias,
+        "time_bias_lambda": (float(model.time_bias_lambda.detach().cpu().item()) if model.time_bias_lambda is not None else None),
+        "use_order_bias": args.use_order_bias,
+        "order_bias_lambda": (float(model.order_bias_lambda.detach().cpu().item()) if model.order_bias_lambda is not None else None),
     }
     torch.save(payload, prefix_output)
     print(f"Saved RAG-prefix LoRA: {lora_output}")
