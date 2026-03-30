@@ -1,26 +1,4 @@
-# Democratizing Large Language Models via Personalized Parameter-Efficient Fine-tuning
-
-
-This is source code of our EMNLP 2024 paper
-
-[**Democratizing Large Language Models via Personalized Parameter-Efficient Fine-tuning**](https://arxiv.org/abs/2402.04401).
-
-
-## Overview ##
-
-* **Ownership**: Existing methods are processed centralized, where user history is encoded in a personalized prompt and processed by centralized LLMs. This paradigm limits the model's customization and ability to provide deep, personalized experiences tailored to individual users. Moreover, when using a centralized model, users often have to share personal data with the service provider, which raises concerns about how user data are stored, used, and protected.
-
-* **Behavior Pattern Generalization**: As is revealed by existing research, LLMs can be easily distracted by irrelevant context information that retrieval can hardly avoid. In LLM personalization, where the retrieval corpus is confined to a specific user's behaviors, retrieval augmentation might underperform, especially when the user's past behaviors do not closely mirror the patterns needed for the query at hand.
-
-<div  align="center">    
-<img src="./asset/teaser.png" width="50%" height="100%">
-</div>
-
-Personalization in large language models (LLMs) is increasingly important, aiming to align the LLMs' interactions, content, and recommendations with individual user preferences. Recent advances have highlighted effective prompt design by enriching user queries with non-parametric knowledge through behavior history retrieval and textual profiles. However, these methods faced limitations due to a lack of model ownership, resulting in constrained customization and privacy issues, and often failed to capture complex, dynamic user behavior patterns. To address these shortcomings, we introduce One PEFT Per User (OPPU), employing personalized parameter-efficient fine-tuning (PEFT) modules to store user-specific behavior patterns and preferences. By plugging in personal PEFT parameters, users can own and use their LLMs individually. OPPU integrates parametric user knowledge in the personal PEFT parameters with non-parametric knowledge from retrieval and profiles, adapting LLMs to user behavior shifts. Experimental results demonstrate that OPPU significantly outperforms existing prompt-based methods across seven diverse tasks in the LaMP benchmark. Further studies reveal OPPU's enhanced capabilities in handling user behavior shifts, modeling users at different activity levels, maintaining robustness across various user history formats, and displaying versatility with different PEFT methods.
-
-<div  align="center">    
-<img src="./asset/overview.png" width="70%" height="100%">
-</div>
+# TAP-PER
 
 ## Dataset ##
 
@@ -53,44 +31,30 @@ Evaluation:
 python eval.py --task_name movie_tagging --ckpt_path ./ckpt/movie_tagging/k0-movie_tagging-llama3.1-8B-task_LoRA_ckpt/ --k 1 --profile
 ```
 
-#### Stage 2: Group memory
+#### Stage 2: Rag prefix + mediator
 
 Training:
 
 ```bash
-python /home/ubuntu/repos/agent/OPPU/cluster_profiles.py --task_name movie_tagging
-
-torchrun --nproc_per_node=8 /home/ubuntu/repos/agent/OPPU/task_LoRA_group.py --task_name movie_tagging
+torchrun --nproc_per_node=8 task_LoRA_ragpag.py --task_name tweet_paraphrase --k 10 --disable_pag --use_time_bias --use_order_bias
 ```
 
 Evaluation:
 
 ```bash
-python /home/ubuntu/repos/agent/OPPU/eval_group.py --task_name movie_tagging --k 1 --profile
+python eval_ragpag.py --task_name tweet_paraphrase --k 10 --use_time_bias --use_order_bias --disable_pag
 ```
 
-#### Stage 3: Local memory + mediator
+#### Stage 3: Rag prefix + pag prefix + mediator
 
 Training:
 
 ```bash
-torchrun --nproc_per_node=8 /home/ubuntu/repos/agent/OPPU/task_LoRA_local_memory.py --task_name movie_tagging --group_mode 1
+torchrun --nproc_per_node=8 task_LoRA_ragpag.py --task_name movie_tagging --k 10 --use_time_bias --use_order_bias
 ```
 
 Evaluation:
 
 ```bash
-python /home/ubuntu/repos/agent/OPPU/eval_local.py --task_name movie_tagging --group_mode 1
-```
-
-## Citation ##
-If you find this paper or codebase useful in your research, please kindly cite the following paper.
-
-```bibtex
-@article{tan2024democratizing,
-  title={Democratizing Large Language Models via Personalized Parameter-Efficient Fine-tuning},
-  author={Tan, Zhaoxuan and Zeng, Qingkai and Tian, Yijun and Liu, Zheyuan and Yin, Bing and Jiang, Meng},
-  journal={arXiv preprint arXiv:2402.04401},
-  year={2024}
-}
+python eval_ragpag.py --task_name movie_tagging --k 10 --use_time_bias --use_order_bias
 ```
