@@ -185,7 +185,7 @@ def build_prompt_pair(idx, profile_item, user_history, profile_text):
                         else:
                             text_to_delta[rec_text] = 0.0
                     if args.use_order_bias:
-                        text_to_order[rec_text] = float(rec_idx + 1)
+                        text_to_order[rec_text] = float(idx - rec_idx)
 
                 if args.use_time_bias:
                     retrieved_delta_days = [text_to_delta.get(t, 0.0) for t in retrieved_texts]

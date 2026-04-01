@@ -28,7 +28,7 @@ torchrun --nproc_per_node=8 task_LoRA.py --task_name movie_tagging
 Evaluation:
 
 ```bash
-python eval.py --task_name movie_tagging --ckpt_path ./ckpt/movie_tagging/k0-movie_tagging-llama3.1-8B-task_LoRA_ckpt/ --k 1 --profile
+python eval.py --task_name movie_tagging --k 1 --profile
 ```
 
 #### Stage 2: Rag prefix + mediator
