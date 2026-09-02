@@ -74,7 +74,7 @@ Evaluation:
 python eval.py --task_name movie_tagging --k 1 --profile
 ```
 
-### Stage 2: Full TAP-PER ($\mathbf{P}_q + \mathbf{P}_u$ + bridge LoRA)
+### Stage 2: Full TAP-PER ($`\mathbf{P}_q + \mathbf{P}_u`$ + bridge LoRA)
 
 Training:
 
@@ -88,7 +88,7 @@ Evaluation:
 python eval_ragpag.py --task_name movie_tagging --use_time_bias --use_order_bias
 ```
 
-### Optional: Record prefix + bridge LoRA only ($\mathbf{P}_q$, no $\mathbf{P}_u$)
+### Optional: Record prefix + bridge LoRA only ($`\mathbf{P}_q`$, no $`\mathbf{P}_u`$)
 
 Training:
 
@@ -125,9 +125,9 @@ the temporal evolution of user preferences.
 
 TAP-PER represents a user with two complementary continuous prefixes:
 
-1. **User-state prefix** $\mathbf{P}_u$: a learnable $L \times d$ embedding that
+1. **User-state prefix** $`\mathbf{P}_u`$: a learnable $`L \times d`$ embedding that
    captures persistent, query-independent preferences.
-2. **Query-conditioned record prefix** $\mathbf{P}_q$: a dynamic prefix obtained
+2. **Query-conditioned record prefix** $`\mathbf{P}_q`$: a dynamic prefix obtained
    by attending to the user's history conditioned on the current query. The
    attention score combines semantic relevance with learnable time-gap and
    order-gap biases, so recent and contextually relevant records receive more
@@ -135,14 +135,14 @@ TAP-PER represents a user with two complementary continuous prefixes:
 
 The prefixes are combined without an additional fusion network:
 
-$$
+```math
 \mathbf{P}_{u,q} = \mathbf{P}_u + \mathbf{P}_q.
-$$
+```
 
 The resulting soft tokens are prepended to the query. A **shared bridge LoRA**
 conditions the frozen task-adapted backbone on these prefix signals. In this
-view, $\mathbf{P}_u$ is a learned counterpart of a user profile, while
-$\mathbf{P}_q$ is a query-conditioned aggregation of the user's full visible
+view, $`\mathbf{P}_u`$ is a learned counterpart of a user profile, while
+$`\mathbf{P}_q`$ is a query-conditioned aggregation of the user's full visible
 history - both are compact and optimized end to end rather than serialized as
 natural-language prompts.
 
@@ -150,33 +150,33 @@ natural-language prompts.
   <img src="asset/method.png" width="100%" alt="TAP-PER architecture">
 </p>
 
-For a query representation $\mathbf{z}_q$ and a history-record representation
-$\mathbf{z}_{h_j}$, TAP-PER first computes content relevance:
+For a query representation $`\mathbf{z}_q`$ and a history-record representation
+$`\mathbf{z}_{h_j}`$, TAP-PER first computes content relevance:
 
-$$
+```math
 s_j = \mathrm{MLP}\!\left(
 \mathbf{z}_q \Vert \mathbf{z}_{h_j} \Vert
 (\mathbf{z}_q - \mathbf{z}_{h_j}) \Vert
 (\mathbf{z}_q \odot \mathbf{z}_{h_j})
 \right).
-$$
+```
 
 It then adds temporal and sequential recency biases:
 
-$$
+```math
 \widetilde{s}_j = s_j
 - \lambda_t \log(1 + \Delta t_j)
 - \lambda_o \log(1 + \Delta \pi_j).
-$$
+```
 
 The normalized history representation is projected into the prefix space:
 
-$$
+```math
 \alpha_j = \mathrm{softmax}(\widetilde{s}_j), \qquad
 \mathbf{P}_q = \mathrm{MLP}\!\left(\sum_j \alpha_j \mathbf{z}_{h_j}\right).
-$$
+```
 
-The history vectors $\mathbf{z}_{h_j}$ are computed once from the frozen input
+The history vectors $`\mathbf{z}_{h_j}`$ are computed once from the frozen input
 embedding layer and reused across queries. The learned attention scores the
 visible history directly, without BM25 or another external retriever.
 
@@ -198,8 +198,8 @@ TAP-PER/
 The main scripts keep the early internal names `rag` and `pag` for checkpoint
 compatibility:
 
-- `rag` corresponds to the query-conditioned record prefix $\mathbf{P}_q$;
-- `pag` corresponds to the learned user-state prefix $\mathbf{P}_u$;
+- `rag` corresponds to the query-conditioned record prefix $`\mathbf{P}_q`$;
+- `pag` corresponds to the learned user-state prefix $`\mathbf{P}_u`$;
 - `mediator` corresponds to the shared bridge LoRA.
 
 Here, `rag` is only a legacy name: `task_LoRA_ragpag.py` and `eval_ragpag.py` do
