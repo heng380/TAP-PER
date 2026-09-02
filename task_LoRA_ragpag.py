@@ -777,7 +777,7 @@ def build_ragpag_lora_config():
     return LoraConfig(
         r=args.ragpag_lora_r,
         lora_alpha=args.ragpag_lora_alpha,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+        target_modules=["q_proj", "v_proj", "k_proj", "out_proj"],
         lora_dropout=args.ragpag_lora_dropout,
         bias="none",
         task_type="CAUSAL_LM",
