@@ -90,92 +90,6 @@ $$
 \mathbf{P}_q = \mathrm{MLP}\!\left(\sum_j \alpha_j \mathbf{z}_{h_j}\right).
 $$
 
-## Two-stage Training
-
-### Stage 1: Task adaptation
-
-A task-level LoRA is trained on query-response pairs aggregated across users.
-After training, this LoRA is merged into the backbone to provide shared task
-knowledge.
-
-### Stage 2: Personalized prefix learning
-
-The task-adapted backbone is frozen. TAP-PER jointly learns:
-
-- the per-user state prefix $\mathbf{P}_u$;
-- the query-conditioned history-attention network for $\mathbf{P}_q$;
-- the time-gap and order-gap decay coefficients;
-- the history-to-prefix projection; and
-- the shared bridge LoRA.
-
-The $\mathbf{P}_q$-only configuration is an ablation trained directly from the
-Stage-1 checkpoint; it is not a separate stage that precedes the full model.
-
-## Main Results
-
-On Llama-3.1-8B, TAP-PER achieves the best result on all six evaluated LaMP
-tasks and all 12 reported task-metric pairs.
-
-| Benchmark | Task | Metric 1 | Metric 2 |
-|---|---|---:|---:|
-| LaMP-1 | Citation identification | Acc: **0.732** | F1: **0.728** |
-| LaMP-2N | News categorization | Acc: **0.838** | F1: **0.622** |
-| LaMP-2M | Movie tagging | Acc: **0.751** | F1: **0.682** |
-| LaMP-3 | Product rating | MAE: **0.170** | RMSE: **0.430** |
-| LaMP-4 | News headline generation | ROUGE-1: **0.219** | ROUGE-L: **0.198** |
-| LaMP-5 | Scholarly title generation | ROUGE-1: **0.538** | ROUGE-L: **0.485** |
-
-Key efficiency findings:
-
-- TAP-PER stores about **32K trainable scalars per user**, compared with about
-  4.2M for OPPU - a **130x reduction** in per-user trainable storage.
-- At 1,000 users, TAP-PER uses **5.7% of OPPU's total parameters** and about
-  **53% of PER-PCS's**.
-- Full-history attention and prefix projection take about **1.04 ms for 1,000
-  cached records** on one A800 in the reported setup.
-- The compact user-state prefix can be updated online while leaving the shared
-  backbone unchanged.
-
-## Analysis
-
-### How temporal attention changes a prediction
-
-In this LaMP-2M example, the non-personalized model and the temporal-free
-variant predict the wrong tag. The complete TAP-PER gives more weight to recent,
-query-relevant records and recovers the correct answer.
-
-<p align="center">
-  <img src="asset/case_study.png" width="100%" alt="Temporal attention case study">
-</p>
-
-### Storage and training-time scaling
-
-TAP-PER scales primarily through its lightweight user-state embeddings rather
-than through a separate large adapter for every user.
-
-<p align="center">
-  <img src="asset/storage_and_time_scaling.png" width="82%" alt="Storage and training-time scaling">
-</p>
-
-### History scope and prefix length
-
-The full-history setting performs best in the paper's sensitivity study. A
-moderate prefix length ($L=8$) provides the best overall trade-off.
-
-<p align="center">
-  <img src="asset/sensitivity.png" width="82%" alt="Sensitivity to history scope and prefix length">
-</p>
-
-### Online adaptation
-
-Updating only the compact user-state prefix provides a lightweight way to absorb
-streaming feedback. Updating the complete personalization module approaches the
-performance of full retraining without replaying the entire training pipeline.
-
-<p align="center">
-  <img src="asset/online.png" width="82%" alt="Online adaptation to streaming feedback">
-</p>
-
 ## Repository Layout
 
 ```text
@@ -231,126 +145,52 @@ The six tasks reported in the paper are:
 | `news_headline` | LaMP-4: Personalized news headline generation |
 | `scholarly_title` | LaMP-5: Personalized scholarly title generation |
 
-## Installation
-
-Create an isolated environment and install the dependencies:
-
-```bash
-conda create -n tapper python=3.10 -y
-conda activate tapper
-pip install -r requirements.txt
-```
-
-The released `requirements.txt` records the original research environment. It
-targets Linux with an NVIDIA CUDA stack (including PyTorch 2.0.1 and CUDA 11.8
-packages) rather than a minimal cross-platform lock file. Install PyTorch and
-CUDA packages appropriate for your machine if your environment differs.
-
-For gated Hugging Face models such as Llama, request model access and log in
-before running the scripts:
-
-```bash
-huggingface-cli login
-```
-
-Training the 8B backbone is GPU intensive. The commands below use eight GPUs to
-match the distributed setup in the paper; reduce `TAPPER_GPUS` if needed and
-adjust the per-device batch size for your hardware.
-
 ## Training and Evaluation
 
-All commands should be run from the repository root. Set the model path or
-Hugging Face model identifier explicitly because the Python scripts retain an
-internal filesystem path as their default.
+`task_name` can be selected from `[citation, movie_tagging, news_categorize,
+news_headline, product_rating, scholarly_title, tweet_paraphrase]`.
+
+### Stage 1: Global memory
+
+Training:
 
 ```bash
-TAPPER_MODEL=/path/to/Llama-3.1-8B
-TAPPER_TASK=movie_tagging
-TAPPER_GPUS=8
-TAPPER_HISTORY_K=10
+torchrun --nproc_per_node=8 task_LoRA.py --task_name movie_tagging
 ```
 
-### 1. Train the shared task adapter
+Evaluation:
 
 ```bash
-torchrun --nproc_per_node="$TAPPER_GPUS" task_LoRA.py \
-  --model_name "$TAPPER_MODEL" \
-  --task_name "$TAPPER_TASK" \
-  --k 0
+python eval.py --task_name movie_tagging --k 1 --profile
 ```
 
-Evaluate the Stage-1 task model without a history or profile prompt:
+### Stage 2: RAG prefix + PAG prefix + mediator
+
+Training:
 
 ```bash
-python eval.py \
-  --model_name "$TAPPER_MODEL" \
-  --task_name "$TAPPER_TASK" \
-  --k 0 \
-  --cuda_id 0
+torchrun --nproc_per_node=8 task_LoRA_ragpag.py --task_name movie_tagging --k 10 --use_time_bias --use_order_bias
 ```
 
-### 2. Train the complete TAP-PER model
+Evaluation:
 
 ```bash
-torchrun --nproc_per_node="$TAPPER_GPUS" task_LoRA_ragpag.py \
-  --model_name "$TAPPER_MODEL" \
-  --task_name "$TAPPER_TASK" \
-  --k "$TAPPER_HISTORY_K" \
-  --use_time_bias \
-  --use_order_bias
+python eval_ragpag.py --task_name movie_tagging --k 10 --use_time_bias --use_order_bias
 ```
 
-Evaluate it with the matching configuration:
+### Optional: RAG prefix + mediator only
+
+Training:
 
 ```bash
-python eval_ragpag.py \
-  --model_name "$TAPPER_MODEL" \
-  --task_name "$TAPPER_TASK" \
-  --k "$TAPPER_HISTORY_K" \
-  --use_time_bias \
-  --use_order_bias \
-  --cuda_id 0
+torchrun --nproc_per_node=8 task_LoRA_ragpag.py --task_name tweet_paraphrase --k 10 --disable_pag --use_time_bias --use_order_bias
 ```
 
-### Optional: query-conditioned prefix only
-
-Use `--disable_pag` to remove the learned user-state prefix $\mathbf{P}_u$ and
-train the $\mathbf{P}_q$-only ablation directly from the Stage-1 checkpoint:
+Evaluation:
 
 ```bash
-torchrun --nproc_per_node="$TAPPER_GPUS" task_LoRA_ragpag.py \
-  --model_name "$TAPPER_MODEL" \
-  --task_name "$TAPPER_TASK" \
-  --k "$TAPPER_HISTORY_K" \
-  --use_time_bias \
-  --use_order_bias \
-  --disable_pag
-
-python eval_ragpag.py \
-  --model_name "$TAPPER_MODEL" \
-  --task_name "$TAPPER_TASK" \
-  --k "$TAPPER_HISTORY_K" \
-  --use_time_bias \
-  --use_order_bias \
-  --disable_pag \
-  --cuda_id 0
+python eval_ragpag.py --task_name tweet_paraphrase --k 10 --use_time_bias --use_order_bias --disable_pag
 ```
-
-> **History-scope note:** The paper uses all available history records by
-> default. The current release retains a configurable `--k` interface and uses
-> BM25 to preselect records when `k` is smaller than the available history. To
-> run the paper's `All` setting, choose a value that covers every history record
-> in the processed split. Smaller values reproduce the history-scope sensitivity
-> setting.
-
-> **Profile-flag note:** `--add_profile` and `--profile` add a generated
-> natural-language profile to the prompt for baseline or diagnostic experiments.
-> They are not required for the learned user-state prefix $\mathbf{P}_u$, which
-> is enabled by default in the complete TAP-PER model.
-
-By default, checkpoints are written to `./ckpt/<task_name>/`, Stage-1 predictions
-to `./output/`, TAP-PER predictions to `./output_ragpag/`, and tokenized Stage-2
-caches to `./cache_rp/`.
 
 ## Citation
 
