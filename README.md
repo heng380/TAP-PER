@@ -1,6 +1,4 @@
-# TAP-PER
-
-## Beyond Retrieval: Learning Compact User Representations for Scalable LLM Personalization
+# Beyond Retrieval: Learning Compact User Representations for Scalable LLM Personalization
 
 <p align="center">
   <strong>Accepted to Findings of the Association for Computational Linguistics: EMNLP 2026</strong>
