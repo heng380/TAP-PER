@@ -17,6 +17,82 @@ serializing a user's raw history into the prompt or storing a large adapter for
 every user, TAP-PER learns a compact dual-track soft prefix and uses a small
 shared LoRA module to integrate it into a task-adapted language model.
 
+## Data
+
+We use the public [LaMP benchmark](https://arxiv.org/abs/2304.11406). Download
+the processed data from [Google Drive](https://drive.google.com/file/d/1bJ3Rh_sqrw3suwwweFbra5CTV7GVjgxF/view?usp=sharing),
+extract it, and place it under `./data`.
+
+The expected layout for each task is:
+
+```text
+data/
+└── <task_name>/
+    ├── user_others.json
+    ├── user_top_100_history.json
+    ├── user_top_100_history_label.json
+    ├── profile_user_100.json       # only for text-profile baselines
+    └── profile_user_others.json    # only for text-profile baselines
+```
+
+The six tasks reported in the paper are:
+
+| Code name | LaMP task |
+|---|---|
+| `citation` | LaMP-1: Personalized citation identification |
+| `news_categorize` | LaMP-2N: Personalized news categorization |
+| `movie_tagging` | LaMP-2M: Personalized movie tagging |
+| `product_rating` | LaMP-3: Personalized product rating |
+| `news_headline` | LaMP-4: Personalized news headline generation |
+| `scholarly_title` | LaMP-5: Personalized scholarly title generation |
+
+## Training and Evaluation
+
+`task_name` can be selected from `[citation, movie_tagging, news_categorize,
+news_headline, product_rating, scholarly_title, tweet_paraphrase]`.
+
+### Stage 1: Global memory
+
+Training:
+
+```bash
+torchrun --nproc_per_node=8 task_LoRA.py --task_name movie_tagging
+```
+
+Evaluation:
+
+```bash
+python eval.py --task_name movie_tagging --k 1 --profile
+```
+
+### Stage 2: RAG prefix + PAG prefix + mediator
+
+Training:
+
+```bash
+torchrun --nproc_per_node=8 task_LoRA_ragpag.py --task_name movie_tagging --k 10 --use_time_bias --use_order_bias
+```
+
+Evaluation:
+
+```bash
+python eval_ragpag.py --task_name movie_tagging --k 10 --use_time_bias --use_order_bias
+```
+
+### Optional: RAG prefix + mediator only
+
+Training:
+
+```bash
+torchrun --nproc_per_node=8 task_LoRA_ragpag.py --task_name tweet_paraphrase --k 10 --disable_pag --use_time_bias --use_order_bias
+```
+
+Evaluation:
+
+```bash
+python eval_ragpag.py --task_name tweet_paraphrase --k 10 --use_time_bias --use_order_bias --disable_pag
+```
+
 ## Why TAP-PER?
 
 Existing personalized LLMs usually personalize at one of two levels:
@@ -115,82 +191,6 @@ The code keeps the early internal names `rag` and `pag` in several files:
 
 These names do **not** mean that full TAP-PER inserts a natural-language RAG or
 PAG prompt.
-
-## Data
-
-We use the public [LaMP benchmark](https://arxiv.org/abs/2304.11406). Download
-the processed data from [Google Drive](https://drive.google.com/file/d/1bJ3Rh_sqrw3suwwweFbra5CTV7GVjgxF/view?usp=sharing),
-extract it, and place it under `./data`.
-
-The expected layout for each task is:
-
-```text
-data/
-└── <task_name>/
-    ├── user_others.json
-    ├── user_top_100_history.json
-    ├── user_top_100_history_label.json
-    ├── profile_user_100.json       # only for text-profile baselines
-    └── profile_user_others.json    # only for text-profile baselines
-```
-
-The six tasks reported in the paper are:
-
-| Code name | LaMP task |
-|---|---|
-| `citation` | LaMP-1: Personalized citation identification |
-| `news_categorize` | LaMP-2N: Personalized news categorization |
-| `movie_tagging` | LaMP-2M: Personalized movie tagging |
-| `product_rating` | LaMP-3: Personalized product rating |
-| `news_headline` | LaMP-4: Personalized news headline generation |
-| `scholarly_title` | LaMP-5: Personalized scholarly title generation |
-
-## Training and Evaluation
-
-`task_name` can be selected from `[citation, movie_tagging, news_categorize,
-news_headline, product_rating, scholarly_title, tweet_paraphrase]`.
-
-### Stage 1: Global memory
-
-Training:
-
-```bash
-torchrun --nproc_per_node=8 task_LoRA.py --task_name movie_tagging
-```
-
-Evaluation:
-
-```bash
-python eval.py --task_name movie_tagging --k 1 --profile
-```
-
-### Stage 2: RAG prefix + PAG prefix + mediator
-
-Training:
-
-```bash
-torchrun --nproc_per_node=8 task_LoRA_ragpag.py --task_name movie_tagging --k 10 --use_time_bias --use_order_bias
-```
-
-Evaluation:
-
-```bash
-python eval_ragpag.py --task_name movie_tagging --k 10 --use_time_bias --use_order_bias
-```
-
-### Optional: RAG prefix + mediator only
-
-Training:
-
-```bash
-torchrun --nproc_per_node=8 task_LoRA_ragpag.py --task_name tweet_paraphrase --k 10 --disable_pag --use_time_bias --use_order_bias
-```
-
-Evaluation:
-
-```bash
-python eval_ragpag.py --task_name tweet_paraphrase --k 10 --use_time_bias --use_order_bias --disable_pag
-```
 
 ## Citation
 
