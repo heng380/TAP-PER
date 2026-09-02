@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import os
 from transformers import AutoTokenizer, AutoConfig, AutoModelForCausalLM
 # from transformers import pipeline, BitsAndBytesConfig
 import argparse
@@ -14,7 +15,7 @@ from peft import LoraConfig, get_peft_model, PeftModel
 
 
 parser = argparse.ArgumentParser(description="Parser for LoRA")
-parser.add_argument('--model_name', type=str, default='/cfs/models/llama/llama3.1-8B')
+parser.add_argument('--model_name', type=str, default=os.environ.get('MODEL_NAME', 'meta-llama/Llama-3.1-8B'))
 parser.add_argument('--batch_size', type=int, default=8)
 parser.add_argument('--k', type=int, default=0)
 parser.add_argument('--max_step', type=int, default=5000)
@@ -23,7 +24,7 @@ parser.add_argument('--max_epoch', type=int, default=3)
 parser.add_argument('--temperature', type=float, default=0.1)
 parser.add_argument('--task_name', type=str, default='movie_tagging')
 parser.add_argument('--add_profile', action='store_true')
-parser.add_argument('--task_lora', type=str, default='/home/ubuntu/repos/agent/OPPU/ckpt/movie_tagging/k0-movie_tagging-llama3.1-8B-task_LoRA_ckpt')
+parser.add_argument('--task_lora', type=str, default=os.environ.get('TASK_LORA_PATH', ''), help='Task LoRA checkpoint path for OPPU evaluation')
 parser.add_argument('--access_token', type=str, default=None)
 
 args = parser.parse_args()
@@ -35,6 +36,9 @@ k = args.k
 cutoff_len = args.cut_off
 add_eos_token = False
 max_epoch = args.max_epoch
+
+if not args.task_lora:
+    raise ValueError('Please provide --task_lora or set TASK_LORA_PATH for OPPU evaluation.')
 
 # # 4 bit quantization inference  
 # bnb_config = BitsAndBytesConfig(
@@ -267,8 +271,8 @@ for i in tqdm(range(len(test_data))):
     if len(train_data) > 0 and i == 0:
         preview_cnt = min(2, len(train_data))
         for preview_idx in range(preview_cnt):
-            print(f"[DEBUG][train sample {preview_idx}] input:\n{train_data[preview_idx]['prompt']}")
-            print(f"[DEBUG][train sample {preview_idx}] target:\n{train_data[preview_idx]['full_prompt']}")
+            print(f"[preview][train sample {preview_idx}] input:\n{train_data[preview_idx]['prompt']}")
+            print(f"[preview][train sample {preview_idx}] target:\n{train_data[preview_idx]['full_prompt']}")
 
     train_dataset = Dataset.from_list(train_data)
     train_dataset = train_dataset.map(generate_and_tokenize_prompt).shuffle()

@@ -26,7 +26,7 @@ from utils import (
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Inference for LoRA")
-    parser.add_argument('--model_name', type=str, default='/cfs/models/llama/llama3.1-8B')
+    parser.add_argument('--model_name', type=str, default=os.environ.get('MODEL_NAME', 'meta-llama/Llama-3.1-8B'))
     parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--k', type=int, default=0)
     parser.add_argument('--cut_off', type=int, default=2048)
@@ -62,7 +62,7 @@ def main():
         local_files_only=False,
         device_map=None,
         trust_remote_code=True,
-        torch_dtype=torch.bfloat16
+        torch_dtype=torch.float16
     ).to(f"cuda:{args.cuda_id}")
 
     base_model.config.use_cache = False

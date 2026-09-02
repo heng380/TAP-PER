@@ -51,6 +51,15 @@ The six tasks reported in the paper are:
 `task_name` can be selected from `[citation, movie_tagging, news_categorize,
 news_headline, product_rating, scholarly_title, tweet_paraphrase]`.
 
+Set `MODEL_NAME` to a local model path or Hugging Face model ID if needed. It
+defaults to `meta-llama/Llama-3.1-8B`.
+
+The main TAP-PER path is retrieval-free. `--k` defaults to `0`, which uses all
+visible history records; a positive value is an optional ablation that keeps
+the most recent `k` records in chronological order, not a top-k retrieval step.
+History records are mean-pooled with the frozen input embedding layer and
+pre-encoded once per user into an in-memory CPU bank.
+
 ### Stage 1: Global memory
 
 Training:
@@ -65,32 +74,32 @@ Evaluation:
 python eval.py --task_name movie_tagging --k 1 --profile
 ```
 
-### Stage 2: RAG prefix + PAG prefix + mediator
+### Stage 2: Full TAP-PER ($\mathbf{P}_q + \mathbf{P}_u$ + bridge LoRA)
 
 Training:
 
 ```bash
-torchrun --nproc_per_node=8 task_LoRA_ragpag.py --task_name movie_tagging --k 10 --use_time_bias --use_order_bias
+torchrun --nproc_per_node=8 task_LoRA_ragpag.py --task_name movie_tagging --use_time_bias --use_order_bias
 ```
 
 Evaluation:
 
 ```bash
-python eval_ragpag.py --task_name movie_tagging --k 10 --use_time_bias --use_order_bias
+python eval_ragpag.py --task_name movie_tagging --use_time_bias --use_order_bias
 ```
 
-### Optional: RAG prefix + mediator only
+### Optional: Record prefix + bridge LoRA only ($\mathbf{P}_q$, no $\mathbf{P}_u$)
 
 Training:
 
 ```bash
-torchrun --nproc_per_node=8 task_LoRA_ragpag.py --task_name tweet_paraphrase --k 10 --disable_pag --use_time_bias --use_order_bias
+torchrun --nproc_per_node=8 task_LoRA_ragpag.py --task_name tweet_paraphrase --disable_pag --use_time_bias --use_order_bias
 ```
 
 Evaluation:
 
 ```bash
-python eval_ragpag.py --task_name tweet_paraphrase --k 10 --use_time_bias --use_order_bias --disable_pag
+python eval_ragpag.py --task_name tweet_paraphrase --use_time_bias --use_order_bias --disable_pag
 ```
 
 ## Why TAP-PER?
@@ -133,8 +142,9 @@ $$
 The resulting soft tokens are prepended to the query. A **shared bridge LoRA**
 conditions the frozen task-adapted backbone on these prefix signals. In this
 view, $\mathbf{P}_u$ is a learned counterpart of a user profile, while
-$\mathbf{P}_q$ is a learned counterpart of retrieved history - both are compact
-and optimized end to end rather than serialized as natural-language prompts.
+$\mathbf{P}_q$ is a query-conditioned aggregation of the user's full visible
+history - both are compact and optimized end to end rather than serialized as
+natural-language prompts.
 
 <p align="center">
   <img src="asset/method.png" width="100%" alt="TAP-PER architecture">
@@ -166,6 +176,10 @@ $$
 \mathbf{P}_q = \mathrm{MLP}\!\left(\sum_j \alpha_j \mathbf{z}_{h_j}\right).
 $$
 
+The history vectors $\mathbf{z}_{h_j}$ are computed once from the frozen input
+embedding layer and reused across queries. The learned attention scores the
+visible history directly, without BM25 or another external retriever.
+
 ## Repository Layout
 
 ```text
@@ -174,8 +188,6 @@ TAP-PER/
 ├── task_LoRA_ragpag.py      # Stage-2 TAP-PER training
 ├── eval.py                  # Stage-1 and prompt-baseline evaluation
 ├── eval_ragpag.py           # Full TAP-PER and P_q-only evaluation
-├── task_LoRA_rag.py         # Record-prefix-only research variant
-├── eval_rag.py              # Evaluation for the record-prefix-only variant
 ├── OPPU.py                  # OPPU baseline
 ├── prompt/                  # LaMP prompt templates
 ├── eval/                    # Task metrics
@@ -183,14 +195,16 @@ TAP-PER/
 └── requirements.txt         # Original research environment
 ```
 
-The code keeps the early internal names `rag` and `pag` in several files:
+The main scripts keep the early internal names `rag` and `pag` for checkpoint
+compatibility:
 
 - `rag` corresponds to the query-conditioned record prefix $\mathbf{P}_q$;
 - `pag` corresponds to the learned user-state prefix $\mathbf{P}_u$;
 - `mediator` corresponds to the shared bridge LoRA.
 
-These names do **not** mean that full TAP-PER inserts a natural-language RAG or
-PAG prompt.
+Here, `rag` is only a legacy name: `task_LoRA_ragpag.py` and `eval_ragpag.py` do
+not perform retrieval or insert natural-language RAG/PAG prompts. They attend
+over pre-encoded history records directly.
 
 ## Citation
 

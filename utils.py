@@ -2,7 +2,7 @@ import re
 
 def extract_option(s, num):
     # Look for string after [1]: and between "
-    match = re.search(r'\[' + str(num) + '\]: "([^"]*)"', s)
+    match = re.search(r'\[' + str(num) + r'\]: "([^"]*)"', s)
     return match.group(1) if match else None
 
 def extract_citation_title(text):

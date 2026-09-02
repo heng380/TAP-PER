@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 
 parser = argparse.ArgumentParser(description="Parser for LoRA")
-parser.add_argument('--model_name', type=str, default='/cfs/models/llama/llama3.1-8B')
+parser.add_argument('--model_name', type=str, default=os.environ.get('MODEL_NAME', 'meta-llama/Llama-3.1-8B'))
 parser.add_argument('--batch_size', type=int, default=1)
 parser.add_argument('--k', type=int, default=0)
 parser.add_argument('--max_step', type=int, default=5000)
@@ -86,7 +86,7 @@ base_model = AutoModelForCausalLM.from_pretrained(
     local_files_only=False,
     device_map=None,
     trust_remote_code=True,
-    torch_dtype=torch.bfloat16
+    torch_dtype=torch.float16
 )
 if args.local_rank != -1:
     base_model = base_model.to(torch.device("cuda", args.local_rank))
@@ -125,7 +125,7 @@ training_arguments = transformers.TrainingArguments(
     logging_steps=20,
     learning_rate=3e-4,
     weight_decay=0.1,
-    bf16=True,
+    fp16=True,
     max_grad_norm=0.3,
     max_steps=-1,
     warmup_ratio=0.03,

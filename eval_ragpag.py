@@ -6,7 +6,6 @@ from datetime import datetime
 import torch
 import torch.nn as nn
 from peft import PeftModel
-from rank_bm25 import BM25Okapi
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -28,9 +27,9 @@ from utils import (
 
 def parse_args():
     parser = argparse.ArgumentParser(description="RAGPAG inference: trainable PAG prefix from RAGPAG + frozen RAG prefix + RAGPAG mediator LoRA")
-    parser.add_argument('--model_name', type=str, default='/cfs/models/llama/llama3.1-8B')
+    parser.add_argument('--model_name', type=str, default=os.environ.get('MODEL_NAME', 'meta-llama/Llama-3.1-8B'))
     parser.add_argument('--batch_size', type=int, default=64)
-    parser.add_argument('--k', type=int, default=10, help='Top-k records used for RAG-prefix attention')
+    parser.add_argument('--k', type=int, default=0, help='Number of previous records for RAG-prefix attention; <=0 attends over all visible history')
     parser.add_argument('--task_name', type=str, default='movie_tagging')
     parser.add_argument('--profile', action='store_true')
     parser.add_argument('--access_token', type=str, default=None)
@@ -41,6 +40,7 @@ def parse_args():
     parser.add_argument('--ragpag_lora_path', type=str, default='', help='RAGPAG mediator LoRA checkpoint path')
     parser.add_argument('--query_max_len', type=int, default=128)
     parser.add_argument('--record_max_len', type=int, default=128)
+    parser.add_argument('--record_encode_batch_size', type=int, default=64)
     parser.add_argument('--use_time_bias', action='store_true', help='Enable recency-based bias in RAG attention')
     parser.add_argument('--use_order_bias', action='store_true', help='Enable order-index bias in RAG attention')
     parser.add_argument('--disable_pag', action='store_true', help='Disable PAG branch and evaluate with RAG prefix only')
@@ -52,18 +52,22 @@ def resolve_task_ckpt_path(task_name, model_name):
     return f"./ckpt/{task_name}/k0-{task_name}-{model_short}-task_LoRA_ckpt"
 
 
+def rag_k_to_tag(k):
+    return "all" if int(k) <= 0 else str(int(k))
+
+
 def resolve_ragpag_prefix_ckpt_path(task_name, model_name, k, profile, use_time_bias=False, use_order_bias=False, disable_pag=False):
     model_short = model_name.split('/')[-1]
     suffix = "-profile" if profile else ""
     bias_tag = f"{'-tb' if use_time_bias else ''}{'-ob' if use_order_bias else ''}{'-nopag' if disable_pag else ''}"
-    return f"./ckpt/{task_name}/k{k}-{task_name}-{model_short}{suffix}{bias_tag}-ragpag-prefix.pt"
+    return f"./ckpt/{task_name}/k{rag_k_to_tag(k)}-{task_name}-{model_short}{suffix}{bias_tag}-ragpag-prefix.pt"
 
 
 def resolve_ragpag_lora_path(task_name, model_name, k, profile, use_time_bias=False, use_order_bias=False, disable_pag=False):
     model_short = model_name.split('/')[-1]
     suffix = "-profile" if profile else ""
     bias_tag = f"{'-tb' if use_time_bias else ''}{'-ob' if use_order_bias else ''}{'-nopag' if disable_pag else ''}"
-    return f"./ckpt/{task_name}/k{k}-{task_name}-{model_short}{suffix}{bias_tag}-ragpag-lora"
+    return f"./ckpt/{task_name}/k{rag_k_to_tag(k)}-{task_name}-{model_short}{suffix}{bias_tag}-ragpag-lora"
 
 
 def parse_date_to_ordinal(value):
@@ -103,8 +107,7 @@ class RagPrefixModule(nn.Module):
         embedding_layer,
         query_input_ids,
         query_attention_mask,
-        record_input_ids,
-        record_attention_mask,
+        record_embeds,
         record_valid_mask,
         record_delta_days=None,
         record_order_idx=None,
@@ -114,16 +117,9 @@ class RagPrefixModule(nn.Module):
         order_bias_lambda=None,
     ):
         batch_size = query_input_ids.size(0)
-        top_k = record_input_ids.size(1)
-        rec_len = record_input_ids.size(2)
-
         q_embeds = embedding_layer(query_input_ids)
         q_vec = self._mean_pool_embeds(q_embeds, query_attention_mask)
-
-        rec_input_ids_flat = record_input_ids.reshape(batch_size * top_k, rec_len)
-        rec_attention_flat = record_attention_mask.reshape(batch_size * top_k, rec_len)
-        rec_embeds_flat = embedding_layer(rec_input_ids_flat)
-        rec_vec = self._mean_pool_embeds(rec_embeds_flat, rec_attention_flat).reshape(batch_size, top_k, self.hidden_size)
+        rec_vec = record_embeds.to(q_vec.dtype)
 
         q_expand = q_vec.unsqueeze(1).expand_as(rec_vec)
         feat = torch.cat([q_expand, rec_vec, q_expand - rec_vec, q_expand * rec_vec], dim=-1)
@@ -153,10 +149,58 @@ class RagPrefixModule(nn.Module):
         return prefix
 
 
-def build_prefix_inputs(tokenizer, query_texts, retrieved_texts_list, rag_k, query_max_len, record_max_len, device, retrieved_delta_days_list=None, retrieved_order_idx_list=None):
+def mean_pool_token_embeddings(embedding_layer, input_ids, attention_mask):
+    embeds = embedding_layer(input_ids)
+    mask = attention_mask.unsqueeze(-1).to(embeds.dtype)
+    summed = (embeds * mask).sum(dim=1)
+    denom = mask.sum(dim=1).clamp_min(1.0)
+    return summed / denom
+
+
+@torch.no_grad()
+def encode_history_records(tokenizer, embedding_layer, history_texts, record_max_len, device, batch_size=64):
+    hidden_size = embedding_layer.weight.shape[-1]
+    if not history_texts:
+        return torch.empty(0, hidden_size, dtype=embedding_layer.weight.dtype)
+
+    encoded_chunks = []
+    for start in range(0, len(history_texts), batch_size):
+        batch_texts = history_texts[start:start + batch_size]
+        tokens = tokenizer(
+            batch_texts,
+            padding=True,
+            truncation=True,
+            max_length=record_max_len,
+            return_tensors="pt",
+        )
+        input_ids = tokens["input_ids"].to(device)
+        attention_mask = tokens["attention_mask"].to(device)
+        pooled = mean_pool_token_embeddings(embedding_layer, input_ids, attention_mask)
+        encoded_chunks.append(pooled.detach().cpu())
+    return torch.cat(encoded_chunks, dim=0)
+
+
+def limit_records(values, rag_k):
+    if int(rag_k) > 0:
+        return values[-int(rag_k):]
+    return values
+
+
+def build_prefix_inputs(tokenizer, query_texts, record_indices_list, record_embedding_bank, rag_k, query_max_len, device, retrieved_delta_days_list=None, retrieved_order_idx_list=None):
     batch_size = len(query_texts)
 
-    record_texts_flat = []
+    record_indices_list = [
+        limit_records([int(x) for x in indices], rag_k) if isinstance(indices, list) else []
+        for indices in record_indices_list
+    ]
+    batch_rag_k = max(1, max((len(indices) for indices in record_indices_list), default=0))
+    record_embeds = torch.zeros(
+        batch_size,
+        batch_rag_k,
+        record_embedding_bank.shape[-1],
+        dtype=record_embedding_bank.dtype,
+        device=device,
+    )
     valid_mask = []
     delta_days_flat = []
     order_idx_flat = []
@@ -166,25 +210,28 @@ def build_prefix_inputs(tokenizer, query_texts, retrieved_texts_list, rag_k, que
     if retrieved_order_idx_list is None:
         retrieved_order_idx_list = [[] for _ in range(batch_size)]
 
-    for recs, deltas, orders in zip(retrieved_texts_list, retrieved_delta_days_list, retrieved_order_idx_list):
-        recs = recs if isinstance(recs, list) else []
-        recs = [str(r) for r in recs][:rag_k]
-
+    for row_idx, (indices, deltas, orders) in enumerate(zip(record_indices_list, retrieved_delta_days_list, retrieved_order_idx_list)):
         deltas = deltas if isinstance(deltas, list) else []
-        deltas = [float(x) if x is not None else 0.0 for x in deltas][:rag_k]
+        deltas = limit_records([float(x) if x is not None else 0.0 for x in deltas], rag_k)
 
         orders = orders if isinstance(orders, list) else []
-        orders = [float(x) if x is not None else 0.0 for x in orders][:rag_k]
+        orders = limit_records([float(x) if x is not None else 0.0 for x in orders], rag_k)
 
-        recs = recs + [""] * (rag_k - len(recs))
-        deltas = deltas + [0.0] * (rag_k - len(deltas))
-        orders = orders + [0.0] * (rag_k - len(orders))
+        if len(deltas) < len(indices):
+            deltas = deltas + [0.0] * (len(indices) - len(deltas))
+        if len(orders) < len(indices):
+            orders = orders + [0.0] * (len(indices) - len(orders))
 
-        for rec, dd, oi in zip(recs, deltas, orders):
-            record_texts_flat.append(rec)
-            valid_mask.append(1 if rec.strip() else 0)
-            delta_days_flat.append(float(dd))
-            order_idx_flat.append(float(oi))
+        for col_idx, rec_idx in enumerate(indices):
+            if rec_idx < 0 or rec_idx >= record_embedding_bank.size(0):
+                raise IndexError(f"record index {rec_idx} out of range for evaluation history")
+            record_embeds[row_idx, col_idx] = record_embedding_bank[rec_idx].to(device)
+
+        for col_idx in range(batch_rag_k):
+            is_valid = col_idx < len(indices)
+            valid_mask.append(1 if is_valid else 0)
+            delta_days_flat.append(float(deltas[col_idx]) if is_valid else 0.0)
+            order_idx_flat.append(float(orders[col_idx]) if is_valid else 0.0)
 
     q_tokens = tokenizer(
         query_texts,
@@ -193,28 +240,17 @@ def build_prefix_inputs(tokenizer, query_texts, retrieved_texts_list, rag_k, que
         max_length=query_max_len,
         return_tensors="pt",
     )
-    r_tokens = tokenizer(
-        record_texts_flat,
-        padding=True,
-        truncation=True,
-        max_length=record_max_len,
-        return_tensors="pt",
-    )
-
     query_input_ids = q_tokens["input_ids"].to(device)
     query_attention_mask = q_tokens["attention_mask"].to(device)
-    record_input_ids = r_tokens["input_ids"].view(batch_size, rag_k, -1).to(device)
-    record_attention_mask = r_tokens["attention_mask"].view(batch_size, rag_k, -1).to(device)
-    record_valid_mask = torch.tensor(valid_mask, dtype=torch.long, device=device).view(batch_size, rag_k)
+    record_valid_mask = torch.tensor(valid_mask, dtype=torch.long, device=device).view(batch_size, batch_rag_k)
 
-    record_delta_days = torch.tensor(delta_days_flat, dtype=torch.float, device=device).view(batch_size, rag_k)
-    record_order_idx = torch.tensor(order_idx_flat, dtype=torch.float, device=device).view(batch_size, rag_k)
+    record_delta_days = torch.tensor(delta_days_flat, dtype=torch.float, device=device).view(batch_size, batch_rag_k)
+    record_order_idx = torch.tensor(order_idx_flat, dtype=torch.float, device=device).view(batch_size, batch_rag_k)
 
     return {
         "query_input_ids": query_input_ids,
         "query_attention_mask": query_attention_mask,
-        "record_input_ids": record_input_ids,
-        "record_attention_mask": record_attention_mask,
+        "record_embeds": record_embeds,
         "record_valid_mask": record_valid_mask,
         "record_delta_days": record_delta_days,
         "record_order_idx": record_order_idx,
@@ -246,6 +282,8 @@ def main():
     args = parse_args()
     model_name = args.model_name
     task_name = args.task_name
+    rag_k_tag = rag_k_to_tag(args.k)
+    rag_history_label = "all_visible_history" if args.k <= 0 else f"last_{args.k}_visible_history"
 
     if not args.golds_json:
         args.golds_json = f"./data/{task_name}/user_top_100_history_label.json"
@@ -282,7 +320,7 @@ def main():
         local_files_only=False,
         device_map=None,
         trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch.float16,
     ).to(f"cuda:{args.cuda_id}")
 
     base_model.config.use_cache = False
@@ -370,23 +408,32 @@ def main():
         user_id = int(test_data[i].get('user_id'))
         profile_text = profile_by_user_id.get(user_id, '') if args.profile else ''
 
+        history_records = []
         history_list = []
-        bm25 = None
-        if args.k > 0:
-            visible_history_list = test_data[i]['profile']
-            for p in visible_history_list:
-                for key, value in p.items():
-                    if isinstance(value, str):
-                        p[key] = get_first_k_tokens(value, 368)
+        record_embedding_bank = torch.empty(0, hidden_size, dtype=model.get_input_embeddings().weight.dtype)
+        for record in test_data[i]['profile']:
+            safe_record = {}
+            for key, value in record.items():
+                if isinstance(value, str):
+                    safe_record[key] = get_first_k_tokens(value, 768)
+                else:
+                    safe_record[key] = value
+            history_records.append(safe_record)
 
-            history_list = [prompt_template[args.task_name]['retrieval_history'].format(**p) for p in visible_history_list]
-            if len(history_list) > 0:
-                tokenized_corpus = [doc.split(" ") for doc in history_list]
-                bm25 = BM25Okapi(tokenized_corpus)
+        history_list = [prompt_template[args.task_name]['retrieval_history'].format(**record) for record in history_records]
+        if len(history_list) > 0:
+            record_embedding_bank = encode_history_records(
+                tokenizer=tokenizer,
+                embedding_layer=model.get_input_embeddings(),
+                history_texts=history_list,
+                record_max_len=record_max_len,
+                device=model.device,
+                batch_size=args.record_encode_batch_size,
+            )
 
         test_prompt_list = []
         query_texts = []
-        retrieved_texts_list = []
+        record_indices_list = []
         retrieved_delta_days_list = []
         retrieved_order_idx_list = []
         question_id_list = []
@@ -408,55 +455,46 @@ def main():
             if args.profile:
                 test_prompt = "##USER PROFILE:\n" + profile_text + "\n" + test_prompt
 
-            retrieved_texts = []
+            record_indices = []
             retrieved_delta_days = []
             retrieved_order_idx = []
-            if args.k > 0 and bm25 is not None:
-                top_n = min(args.k, len(history_list))
-                retrieved_texts = bm25.get_top_n(retrieval_query.split(" "), history_list, n=top_n)
-
+            if len(history_list) > 0:
+                start_idx = 0 if args.k <= 0 else max(0, len(history_list) - args.k)
+                record_indices = list(range(start_idx, len(history_list)))
                 if use_time_bias or use_order_bias:
-                    text_to_delta = {}
-                    text_to_order = {}
                     query_date_ord = parse_date_to_ordinal(q.get("date", None))
                     if query_date_ord is None:
-                        query_date_ord = parse_date_to_ordinal(test_data[i]['profile'][-1].get("date", None))
-                    for rec_idx, rec in enumerate(test_data[i]['profile']):
-                        rec_text = prompt_template[args.task_name]['retrieval_history'].format(**rec)
+                        query_date_ord = parse_date_to_ordinal(history_records[-1].get("date", None))
+                    for rec_idx in record_indices:
+                        rec = history_records[rec_idx]
                         if use_time_bias:
                             rec_date_ord = parse_date_to_ordinal(rec.get("date", None))
                             if query_date_ord is not None and rec_date_ord is not None:
-                                text_to_delta[rec_text] = float(max(0, query_date_ord - rec_date_ord))
+                                retrieved_delta_days.append(float(max(0, query_date_ord - rec_date_ord)))
                             else:
-                                text_to_delta[rec_text] = 0.0
+                                retrieved_delta_days.append(0.0)
                         if use_order_bias:
-                            text_to_order[rec_text] = float(rec_idx + 1)
-
-                    if use_time_bias:
-                        retrieved_delta_days = [text_to_delta.get(t, 0.0) for t in retrieved_texts]
-                    if use_order_bias:
-                        retrieved_order_idx = [text_to_order.get(t, 0.0) for t in retrieved_texts]
+                            retrieved_order_idx.append(float(len(history_records) - rec_idx))
 
             test_prompt_list.append(test_prompt)
             query_texts.append(retrieval_query)
-            retrieved_texts_list.append(retrieved_texts)
+            record_indices_list.append(record_indices)
             retrieved_delta_days_list.append(retrieved_delta_days)
             retrieved_order_idx_list.append(retrieved_order_idx)
             question_id_list.append(q['id'])
 
         prompt_batch_list = split_batch(test_prompt_list, args.batch_size)
         query_batch_list = split_batch(query_texts, args.batch_size)
-        retrieved_batch_list = split_batch(retrieved_texts_list, args.batch_size)
+        record_indices_batch_list = split_batch(record_indices_list, args.batch_size)
         delta_batch_list = split_batch(retrieved_delta_days_list, args.batch_size)
         order_batch_list = split_batch(retrieved_order_idx_list, args.batch_size)
-        qid_batch_list = split_batch(question_id_list, args.batch_size)
 
         out_list = []
         with torch.inference_mode():
             for batch_idx in range(len(prompt_batch_list)):
                 prompt_batch = prompt_batch_list[batch_idx]
                 query_batch = query_batch_list[batch_idx]
-                retrieved_batch = retrieved_batch_list[batch_idx]
+                record_indices_batch = record_indices_batch_list[batch_idx]
                 delta_batch = delta_batch_list[batch_idx]
                 order_batch = order_batch_list[batch_idx]
 
@@ -466,10 +504,10 @@ def main():
                 rag_inputs = build_prefix_inputs(
                     tokenizer=tokenizer,
                     query_texts=query_batch,
-                    retrieved_texts_list=retrieved_batch,
-                    rag_k=max(1, args.k),
+                    record_indices_list=record_indices_batch,
+                    record_embedding_bank=record_embedding_bank,
+                    rag_k=args.k,
                     query_max_len=query_max_len,
-                    record_max_len=record_max_len,
                     device=model.device,
                     retrieved_delta_days_list=delta_batch,
                     retrieved_order_idx_list=order_batch,
@@ -538,7 +576,11 @@ def main():
             prompt_output_records.append({
                 "id": question_id,
                 "user_id": user_id,
-                "prompt": ("[ragpag_prefix=rag_only(no_pag)]\n" if disable_pag else "[ragpag_prefix=pag+rag(joint-trained)]\n") + test_prompt_list[j],
+                "prompt": (
+                    f"[ragpag_prefix=preencoded_{rag_history_label}_rag_only(no_pag)]\n"
+                    if disable_pag
+                    else f"[ragpag_prefix=pag+preencoded_{rag_history_label}_rag(joint-trained)]\n"
+                ) + test_prompt_list[j],
                 "output": output,
                 "gold": golds_dict.get(question_id, ""),
             })
@@ -551,16 +593,16 @@ def main():
         'model': model_name,
     }
 
-    output_dir = f"./output_ragpag/{args.k}"
+    output_dir = f"./output_ragpag/{rag_k_tag}"
     preds_dir = f"{output_dir}/preds"
     os.makedirs(preds_dir, exist_ok=True)
 
     if args.profile:
-        preds_path = f"{preds_dir}/output-task-ragpag-k{args.k}-{args.task_name}-{model_name.split('/')[-1]}-profile.json"
-        prompt_output_path = f"{output_dir}/prompt-output-ragpag-k{args.k}-{args.task_name}-{model_name.split('/')[-1]}-profile.jsonl"
+        preds_path = f"{preds_dir}/output-task-ragpag-k{rag_k_tag}-{args.task_name}-{model_name.split('/')[-1]}-profile.json"
+        prompt_output_path = f"{output_dir}/prompt-output-ragpag-k{rag_k_tag}-{args.task_name}-{model_name.split('/')[-1]}-profile.jsonl"
     else:
-        preds_path = f"{preds_dir}/output-task-ragpag-k{args.k}-{args.task_name}-{model_name.split('/')[-1]}.json"
-        prompt_output_path = f"{output_dir}/prompt-output-ragpag-k{args.k}-{args.task_name}-{model_name.split('/')[-1]}.jsonl"
+        preds_path = f"{preds_dir}/output-task-ragpag-k{rag_k_tag}-{args.task_name}-{model_name.split('/')[-1]}.json"
+        prompt_output_path = f"{output_dir}/prompt-output-ragpag-k{rag_k_tag}-{args.task_name}-{model_name.split('/')[-1]}.jsonl"
 
     with open(preds_path, 'w') as f:
         json.dump(output_file, f, indent=4)

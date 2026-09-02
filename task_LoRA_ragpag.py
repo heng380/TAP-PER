@@ -9,7 +9,6 @@ import torch.nn as nn
 import transformers
 from datasets import Dataset, load_from_disk
 from peft import PeftModel, LoraConfig, get_peft_model
-from rank_bm25 import BM25Okapi
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -17,9 +16,9 @@ from utils import get_first_k_tokens
 
 
 parser = argparse.ArgumentParser(description="Train RAG+PAG jointly from task LoRA: trainable RAG DIN + PAG embedding + mediator LoRA")
-parser.add_argument('--model_name', type=str, default='/cfs/models/llama/llama3.1-8B')
+parser.add_argument('--model_name', type=str, default=os.environ.get('MODEL_NAME', 'meta-llama/Llama-3.1-8B'))
 parser.add_argument('--batch_size', type=int, default=1)
-parser.add_argument('--k', type=int, default=10, help='Top-k records for RAG-prefix attention')
+parser.add_argument('--k', type=int, default=0, help='Number of previous records for RAG-prefix attention; <=0 attends over all visible history')
 parser.add_argument('--cut_off', type=int, default=2048)
 parser.add_argument('--max_epoch', type=int, default=3)
 parser.add_argument('--prefix_len', type=int, default=8)
@@ -33,6 +32,7 @@ parser.add_argument('--ragpag_lora_alpha', type=int, default=8)
 parser.add_argument('--ragpag_lora_dropout', type=float, default=0.05)
 parser.add_argument('--query_max_len', type=int, default=128)
 parser.add_argument('--record_max_len', type=int, default=128)
+parser.add_argument('--record_encode_batch_size', type=int, default=64)
 parser.add_argument('--use_time_bias', action='store_true', help='Enable recency-based bias in RAG attention')
 parser.add_argument('--use_order_bias', action='store_true', help='Enable order-index bias in RAG attention')
 parser.add_argument('--disable_pag', action='store_true', help='Disable PAG branch and train RAG+mediator only')
@@ -86,6 +86,7 @@ model_name = args.model_name
 task_name = args.task_name
 batch_size = args.batch_size
 k = args.k
+rag_k_tag = "all" if args.k <= 0 else str(args.k)
 cutoff_len = args.cut_off
 add_eos_token = False
 max_epoch = args.max_epoch
@@ -96,9 +97,11 @@ with open(f"./data/{task_name}/user_top_100_history.json", 'r') as f:
 with open('./prompt/prompt.json', 'r') as f:
     prompt_template = json.load(f)
 
-format_flag = False
-if args.task_name in ["movie_tagging", "news_categorize", "news_headline", "product_rating", "scholarly_title"]:
-    format_flag = True
+task_prompt_template = prompt_template.get(args.task_name, {})
+format_flag = all(
+    key in task_prompt_template
+    for key in ["OPPU_input", "OPPU_full", "retrieval_history"]
+)
 
 profile_by_user_id = {}
 if args.add_profile:
@@ -158,45 +161,29 @@ def build_prompt_pair(idx, profile_item, user_history, profile_text):
     else:
         query_text = prompt
 
-    retrieved_texts = []
+    record_indices = []
     retrieved_delta_days = []
     retrieved_order_idx = []
-    if k > 0 and idx != 0 and format_flag:
-        visible_history_list = [safe_truncate_dict(h, limit=768) for h in user_history[:idx]]
-        history_list = [prompt_template[args.task_name]['retrieval_history'].format(**p) for p in visible_history_list]
-
-        if len(history_list) > 0:
-            tokenized_corpus = [doc.split(" ") for doc in history_list]
-            bm25 = BM25Okapi(tokenized_corpus)
-            tokenized_query = query_text.split(' ')
-            top_n = min(args.k, len(history_list))
-            retrieved_texts = bm25.get_top_n(tokenized_query, history_list, n=top_n)
-
-            if args.use_time_bias or args.use_order_bias:
-                text_to_delta = {}
-                text_to_order = {}
-                query_date_ord = parse_date_to_ordinal(profile_item.get("date", None))
-                for rec_idx, rec in enumerate(visible_history_list):
-                    rec_text = prompt_template[args.task_name]['retrieval_history'].format(**rec)
-                    if args.use_time_bias:
-                        rec_date_ord = parse_date_to_ordinal(rec.get("date", None))
-                        if query_date_ord is not None and rec_date_ord is not None:
-                            text_to_delta[rec_text] = float(max(0, query_date_ord - rec_date_ord))
-                        else:
-                            text_to_delta[rec_text] = 0.0
-                    if args.use_order_bias:
-                        text_to_order[rec_text] = float(idx - rec_idx)
-
-                if args.use_time_bias:
-                    retrieved_delta_days = [text_to_delta.get(t, 0.0) for t in retrieved_texts]
-                if args.use_order_bias:
-                    retrieved_order_idx = [text_to_order.get(t, 0.0) for t in retrieved_texts]
+    if idx != 0 and format_flag:
+        start_idx = 0 if args.k <= 0 else max(0, idx - args.k)
+        record_indices = list(range(start_idx, idx))
+        query_date_ord = parse_date_to_ordinal(profile_item.get("date", None))
+        for rec_idx in record_indices:
+            rec = user_history[rec_idx]
+            if args.use_time_bias:
+                rec_date_ord = parse_date_to_ordinal(rec.get("date", None))
+                if query_date_ord is not None and rec_date_ord is not None:
+                    retrieved_delta_days.append(float(max(0, query_date_ord - rec_date_ord)))
+                else:
+                    retrieved_delta_days.append(0.0)
+            if args.use_order_bias:
+                retrieved_order_idx.append(float(idx - rec_idx))
 
     if args.add_profile and format_flag:
         prompt = profile_text + "\n" + prompt
         full_prompt = profile_text + "\n" + full_prompt
 
-    return prompt, full_prompt, query_text, retrieved_texts, retrieved_delta_days, retrieved_order_idx
+    return prompt, full_prompt, query_text, record_indices, retrieved_delta_days, retrieved_order_idx
 
 
 def build_train_data(users):
@@ -206,7 +193,7 @@ def build_train_data(users):
         profile_text = profile_by_user_id.get(uid, "") if args.add_profile else ""
 
         for idx, profile_item in enumerate(sample['profile']):
-            prompt, full_prompt, query_text, retrieved_texts, retrieved_delta_days, retrieved_order_idx = build_prompt_pair(
+            prompt, full_prompt, query_text, record_indices, retrieved_delta_days, retrieved_order_idx = build_prompt_pair(
                 idx, profile_item, sample['profile'], profile_text
             )
             train_data.append({
@@ -214,7 +201,7 @@ def build_train_data(users):
                 "full_prompt": full_prompt,
                 "user_id": uid,
                 "query_text": query_text,
-                "retrieved_texts": retrieved_texts,
+                "record_indices": record_indices,
                 "retrieved_delta_days": retrieved_delta_days,
                 "retrieved_order_idx": retrieved_order_idx,
             })
@@ -258,7 +245,7 @@ def create_tokenizers(tokenizer):
 
         tokenized_full_prompt["user_id"] = data_point["user_id"]
         tokenized_full_prompt["query_text"] = data_point["query_text"]
-        tokenized_full_prompt["retrieved_texts"] = data_point["retrieved_texts"]
+        tokenized_full_prompt["record_indices"] = data_point["record_indices"]
         tokenized_full_prompt["retrieved_delta_days"] = data_point.get("retrieved_delta_days", [])
         tokenized_full_prompt["retrieved_order_idx"] = data_point.get("retrieved_order_idx", [])
         return tokenized_full_prompt
@@ -285,7 +272,7 @@ def create_frozen_task_backbone_and_tokenizer():
         local_files_only=False,
         device_map=None,
         trust_remote_code=True,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch.float16,
     )
     if args.local_rank != -1:
         base_model = base_model.to(torch.device("cuda", args.local_rank))
@@ -330,8 +317,7 @@ class RagPrefixModule(nn.Module):
         embedding_layer,
         query_input_ids,
         query_attention_mask,
-        record_input_ids,
-        record_attention_mask,
+        record_embeds,
         record_valid_mask,
         record_delta_days=None,
         record_order_idx=None,
@@ -341,16 +327,10 @@ class RagPrefixModule(nn.Module):
         order_bias_lambda=None,
     ):
         batch_size = query_input_ids.size(0)
-        top_k = record_input_ids.size(1)
-        rec_len = record_input_ids.size(2)
 
         q_embeds = embedding_layer(query_input_ids)
         q_vec = self._mean_pool_embeds(q_embeds, query_attention_mask)
-
-        rec_input_ids_flat = record_input_ids.reshape(batch_size * top_k, rec_len)
-        rec_attention_flat = record_attention_mask.reshape(batch_size * top_k, rec_len)
-        rec_embeds_flat = embedding_layer(rec_input_ids_flat)
-        rec_vec = self._mean_pool_embeds(rec_embeds_flat, rec_attention_flat).reshape(batch_size, top_k, self.hidden_size)
+        rec_vec = record_embeds.to(q_vec.dtype)
 
         q_expand = q_vec.unsqueeze(1).expand_as(rec_vec)
         feat = torch.cat([q_expand, rec_vec, q_expand - rec_vec, q_expand * rec_vec], dim=-1)
@@ -452,8 +432,7 @@ class RagPagPrefixModel(nn.Module):
         self,
         query_input_ids,
         query_attention_mask,
-        record_input_ids,
-        record_attention_mask,
+        record_embeds,
         record_valid_mask,
         record_delta_days=None,
         record_order_idx=None,
@@ -462,8 +441,7 @@ class RagPagPrefixModel(nn.Module):
             embedding_layer=self.base_model.get_input_embeddings(),
             query_input_ids=query_input_ids,
             query_attention_mask=query_attention_mask,
-            record_input_ids=record_input_ids,
-            record_attention_mask=record_attention_mask,
+            record_embeds=record_embeds,
             record_valid_mask=record_valid_mask,
             record_delta_days=record_delta_days,
             record_order_idx=record_order_idx,
@@ -481,8 +459,7 @@ class RagPagPrefixModel(nn.Module):
         user_id=None,
         query_input_ids=None,
         query_attention_mask=None,
-        record_input_ids=None,
-        record_attention_mask=None,
+        record_embeds=None,
         record_valid_mask=None,
         record_delta_days=None,
         record_order_idx=None,
@@ -507,8 +484,7 @@ class RagPagPrefixModel(nn.Module):
         if (
             query_input_ids is None
             or query_attention_mask is None
-            or record_input_ids is None
-            or record_attention_mask is None
+            or record_embeds is None
             or record_valid_mask is None
         ):
             rag_prefix = torch.zeros(
@@ -522,8 +498,7 @@ class RagPagPrefixModel(nn.Module):
             rag_prefix = self._build_rag_prefix(
                 query_input_ids=query_input_ids,
                 query_attention_mask=query_attention_mask,
-                record_input_ids=record_input_ids,
-                record_attention_mask=record_attention_mask,
+                record_embeds=record_embeds,
                 record_valid_mask=record_valid_mask,
                 record_delta_days=record_delta_days,
                 record_order_idx=record_order_idx,
@@ -559,57 +534,124 @@ class RagPagPrefixModel(nn.Module):
         )
 
 
+def mean_pool_token_embeddings(embedding_layer, input_ids, attention_mask):
+    embeds = embedding_layer(input_ids)
+    mask = attention_mask.unsqueeze(-1).to(embeds.dtype)
+    summed = (embeds * mask).sum(dim=1)
+    denom = mask.sum(dim=1).clamp_min(1.0)
+    return summed / denom
+
+
+@torch.no_grad()
+def build_record_embedding_bank(users, tokenizer, embedding_layer, device, hidden_size):
+    bank = {}
+    iterator = tqdm(users, disable=not is_main_process, desc="Pre-encoding history records")
+    for sample in iterator:
+        uid = int(sample["user_id"])
+        history_texts = []
+        if format_flag:
+            for record in sample["profile"]:
+                safe_record = safe_truncate_dict(record, limit=768)
+                history_texts.append(prompt_template[args.task_name]["retrieval_history"].format(**safe_record))
+
+        if not history_texts:
+            bank[uid] = torch.empty(0, hidden_size, dtype=embedding_layer.weight.dtype)
+            continue
+
+        encoded_chunks = []
+        for start in range(0, len(history_texts), args.record_encode_batch_size):
+            batch_texts = history_texts[start:start + args.record_encode_batch_size]
+            tokens = tokenizer(
+                batch_texts,
+                padding=True,
+                truncation=True,
+                max_length=args.record_max_len,
+                return_tensors="pt",
+            )
+            input_ids = tokens["input_ids"].to(device)
+            attention_mask = tokens["attention_mask"].to(device)
+            pooled = mean_pool_token_embeddings(embedding_layer, input_ids, attention_mask)
+            encoded_chunks.append(pooled.detach().cpu())
+
+        bank[uid] = torch.cat(encoded_chunks, dim=0)
+    return bank
+
+
 class RpCollator:
-    def __init__(self, tokenizer, rag_k, query_max_len=128, record_max_len=128):
+    def __init__(self, tokenizer, rag_k, record_embedding_bank, hidden_size, query_max_len=128):
         self.tokenizer = tokenizer
-        self.rag_k = max(1, rag_k)
+        self.rag_k = int(rag_k)
+        self.record_embedding_bank = record_embedding_bank
+        self.hidden_size = hidden_size
         self.query_max_len = query_max_len
-        self.record_max_len = record_max_len
         self.inner_collator = transformers.DataCollatorForSeq2Seq(
             tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
         )
+
+    def _limit_records(self, values):
+        if self.rag_k > 0:
+            return values[-self.rag_k:]
+        return values
 
     def __call__(self, features):
         user_ids = torch.tensor([int(f.get("user_id", -1)) for f in features], dtype=torch.long)
         query_texts = [str(f.get("query_text", "")) for f in features]
 
-        record_texts_flat = []
+        record_index_lists = []
+        max_records = 0
+        for f in features:
+            indices = f.get("record_indices", [])
+            if not isinstance(indices, list):
+                indices = []
+            indices = self._limit_records([int(x) for x in indices])
+            record_index_lists.append(indices)
+            max_records = max(max_records, len(indices))
+
+        batch_rag_k = max(1, max_records)
+        bank_dtype = next(iter(self.record_embedding_bank.values())).dtype if self.record_embedding_bank else torch.float16
+        record_embeds = torch.zeros(len(features), batch_rag_k, self.hidden_size, dtype=bank_dtype)
         valid_mask = []
         delta_days_flat = []
         order_idx_flat = []
-        for f in features:
-            recs = f.get("retrieved_texts", [])
-            if not isinstance(recs, list):
-                recs = []
-            recs = [str(r) for r in recs][: self.rag_k]
+        for row_idx, (f, indices) in enumerate(zip(features, record_index_lists)):
             deltas = f.get("retrieved_delta_days", [])
             if not isinstance(deltas, list):
                 deltas = []
-            deltas = [float(x) if x is not None else 0.0 for x in deltas][: self.rag_k]
+            deltas = self._limit_records([float(x) if x is not None else 0.0 for x in deltas])
             orders = f.get("retrieved_order_idx", [])
             if not isinstance(orders, list):
                 orders = []
-            orders = [float(x) if x is not None else 0.0 for x in orders][: self.rag_k]
+            orders = self._limit_records([float(x) if x is not None else 0.0 for x in orders])
 
-            if len(recs) < self.rag_k:
-                recs = recs + [""] * (self.rag_k - len(recs))
-            if len(deltas) < self.rag_k:
-                deltas = deltas + [0.0] * (self.rag_k - len(deltas))
-            if len(orders) < self.rag_k:
-                orders = orders + [0.0] * (self.rag_k - len(orders))
+            uid = int(f.get("user_id", -1))
+            user_bank = self.record_embedding_bank.get(uid)
+            if user_bank is None:
+                raise KeyError(f"Missing pre-encoded record bank for user_id={uid}")
 
-            for rec, dd, oi in zip(recs, deltas, orders):
-                record_texts_flat.append(rec)
-                valid_mask.append(1 if rec.strip() else 0)
-                delta_days_flat.append(float(dd))
-                order_idx_flat.append(float(oi))
+            for col_idx, rec_idx in enumerate(indices):
+                if rec_idx < 0 or rec_idx >= user_bank.size(0):
+                    raise IndexError(f"record index {rec_idx} out of range for user_id={uid}")
+                record_embeds[row_idx, col_idx] = user_bank[rec_idx]
+
+            if len(deltas) < len(indices):
+                deltas = deltas + [0.0] * (len(indices) - len(deltas))
+            if len(orders) < len(indices):
+                orders = orders + [0.0] * (len(indices) - len(orders))
+
+            for col_idx in range(batch_rag_k):
+                is_valid = col_idx < len(indices)
+                valid_mask.append(1 if is_valid else 0)
+                delta_days_flat.append(float(deltas[col_idx]) if is_valid else 0.0)
+                order_idx_flat.append(float(orders[col_idx]) if is_valid else 0.0)
 
         stripped = []
         for f in features:
             item = dict(f)
+            item.pop("prompt", None)
+            item.pop("full_prompt", None)
             item.pop("user_id", None)
             item.pop("query_text", None)
-            item.pop("retrieved_texts", None)
+            item.pop("record_indices", None)
             item.pop("retrieved_delta_days", None)
             item.pop("retrieved_order_idx", None)
             stripped.append(item)
@@ -623,23 +665,15 @@ class RpCollator:
             max_length=self.query_max_len,
             return_tensors="pt",
         )
-        rec_tokens = self.tokenizer(
-            record_texts_flat,
-            padding=True,
-            truncation=True,
-            max_length=self.record_max_len,
-            return_tensors="pt",
-        )
 
         batch_size = len(features)
         batch["user_id"] = user_ids
         batch["query_input_ids"] = query_tokens["input_ids"]
         batch["query_attention_mask"] = query_tokens["attention_mask"]
-        batch["record_input_ids"] = rec_tokens["input_ids"].view(batch_size, self.rag_k, -1)
-        batch["record_attention_mask"] = rec_tokens["attention_mask"].view(batch_size, self.rag_k, -1)
-        batch["record_valid_mask"] = torch.tensor(valid_mask, dtype=torch.long).view(batch_size, self.rag_k)
-        batch["record_delta_days"] = torch.tensor(delta_days_flat, dtype=torch.float).view(batch_size, self.rag_k)
-        batch["record_order_idx"] = torch.tensor(order_idx_flat, dtype=torch.float).view(batch_size, self.rag_k)
+        batch["record_embeds"] = record_embeds
+        batch["record_valid_mask"] = torch.tensor(valid_mask, dtype=torch.long).view(batch_size, batch_rag_k)
+        batch["record_delta_days"] = torch.tensor(delta_days_flat, dtype=torch.float).view(batch_size, batch_rag_k)
+        batch["record_order_idx"] = torch.tensor(order_idx_flat, dtype=torch.float).view(batch_size, batch_rag_k)
         return batch
 
 
@@ -666,7 +700,7 @@ training_arguments = transformers.TrainingArguments(
     logging_steps=10,
     learning_rate=effective_lr,
     weight_decay=1e-2,
-    bf16=True,
+    fp16=True,
     max_grad_norm=0.3,
     warmup_ratio=0.1,
     group_by_length=True,
@@ -681,7 +715,7 @@ users = train
 if is_main_process:
     print(f"Loaded train users (top100): {len(users)}")
 
-cache_tag = f"k{args.k}{'-profile' if args.add_profile else ''}{'-tb' if args.use_time_bias else ''}{'-ob' if args.use_order_bias else ''}{'-nopag' if args.disable_pag else ''}"
+cache_tag = f"k{rag_k_tag}-preenc-free{'-profile' if args.add_profile else ''}{'-tb' if args.use_time_bias else ''}{'-ob' if args.use_order_bias else ''}{'-nopag' if args.disable_pag else ''}-{model_name.split('/')[-1]}"
 cache_path = os.path.join(
     args.cache_dir,
     args.task_name,
@@ -711,7 +745,7 @@ else:
             print(f"full_prompt:\n{train_data[preview_idx]['full_prompt']}")
             print(f"user_id: {train_data[preview_idx]['user_id']}")
             print(f"query_text:\n{train_data[preview_idx]['query_text']}")
-            print(f"retrieved_texts:\n{train_data[preview_idx]['retrieved_texts']}")
+            print(f"record_indices:\n{train_data[preview_idx]['record_indices']}")
 
     _, tokenizer_for_cache, _ = create_frozen_task_backbone_and_tokenizer()
     generate_and_tokenize_prompt_for_cache = create_tokenizers(tokenizer_for_cache)
@@ -730,13 +764,20 @@ if args.preprocess_only:
     raise SystemExit(0)
 
 frozen_model, tokenizer, task_ckpt_path = create_frozen_task_backbone_and_tokenizer()
+record_embedding_bank = build_record_embedding_bank(
+    users=users,
+    tokenizer=tokenizer,
+    embedding_layer=frozen_model.get_input_embeddings(),
+    device=frozen_model.get_input_embeddings().weight.device,
+    hidden_size=int(frozen_model.config.hidden_size),
+)
 
 
 def build_ragpag_lora_config():
     return LoraConfig(
         r=args.ragpag_lora_r,
         lora_alpha=args.ragpag_lora_alpha,
-        target_modules=["q_proj", "v_proj", "k_proj", "out_proj"],
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
         lora_dropout=args.ragpag_lora_dropout,
         bias="none",
         task_type="CAUSAL_LM",
@@ -782,8 +823,9 @@ trainer = transformers.Trainer(
     data_collator=RpCollator(
         tokenizer,
         rag_k=args.k,
+        record_embedding_bank=record_embedding_bank,
+        hidden_size=hidden_size,
         query_max_len=args.query_max_len,
-        record_max_len=args.record_max_len,
     ),
 )
 
@@ -793,8 +835,8 @@ os.makedirs(f"./ckpt/{args.task_name}", exist_ok=True)
 model_short = model_name.split('/')[-1]
 suffix = "-profile" if args.add_profile else ""
 bias_tag = f"{'-tb' if args.use_time_bias else ''}{'-ob' if args.use_order_bias else ''}{'-nopag' if args.disable_pag else ''}"
-ragpag_lora_output = f"./ckpt/{args.task_name}/k{args.k}-{args.task_name}-{model_short}{suffix}{bias_tag}-ragpag-lora"
-ragpag_prefix_output = f"./ckpt/{args.task_name}/k{args.k}-{args.task_name}-{model_short}{suffix}{bias_tag}-ragpag-prefix.pt"
+ragpag_lora_output = f"./ckpt/{args.task_name}/k{rag_k_tag}-{args.task_name}-{model_short}{suffix}{bias_tag}-ragpag-lora"
+ragpag_prefix_output = f"./ckpt/{args.task_name}/k{rag_k_tag}-{args.task_name}-{model_short}{suffix}{bias_tag}-ragpag-prefix.pt"
 
 if is_main_process:
     model.base_model.save_pretrained(ragpag_lora_output)
@@ -802,12 +844,14 @@ if is_main_process:
         "task_name": args.task_name,
         "model_name": args.model_name,
         "k": args.k,
+        "rag_k_mode": "all_visible_history" if args.k <= 0 else "last_k_visible_history",
         "add_profile": args.add_profile,
         "base_task_ckpt": task_ckpt_path,
         "hidden_size": hidden_size,
         "prefix_len": prefix_len,
         "query_max_len": args.query_max_len,
         "record_max_len": args.record_max_len,
+        "record_embedding_mode": "preencoded_mean_pool_all_history",
         "user_id_to_index": user_id_to_index,
         "disable_pag": args.disable_pag,
         "pag_user_embedding": ({k: v.detach().cpu() for k, v in model.pag_user_embedding.state_dict().items()} if model.pag_user_embedding is not None else None),
