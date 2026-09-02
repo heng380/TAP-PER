@@ -4,11 +4,6 @@
   <strong>Accepted to Findings of the Association for Computational Linguistics: EMNLP 2026</strong>
 </p>
 
-<p align="center">
-  Heng Cao, Fan Zhang, Jian Yao, Yujie Zheng, Changlin Zhao, Lu Hao,<br>
-  Yuxuan Wei, Wangze Ni, Huaiyu Fu, Yuqian Sun, and Xuyan Mo
-</p>
-
 TAP-PER (**T**emporal **A**ttentive **P**refix for **PER**sonalization) is a
 representation-based framework for scalable LLM personalization. Instead of
 serializing a user's raw history into the prompt or storing a large adapter for
